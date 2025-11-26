@@ -1,0 +1,7 @@
+name: cm2
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - caiman=1.12
+  - lightning=2.5
