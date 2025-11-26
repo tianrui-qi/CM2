@@ -1,0 +1,57 @@
+{
+    "data": {
+        "fr": 10,
+        "decay_time": 1.5,
+        "dxy": [2.5, 2.5]
+    },
+    "init": {
+        "method_init": "corr_pnr",
+        "K": null,
+        "gSig": [3, 3],
+        "gSiz": [7, 7],
+        "ssub": 1,
+        "tsub": 1,
+        "nb": 0,
+        "min_corr": 0.7,
+        "min_pnr": 10,
+        "normalize_init": true,
+        "center_psf": true,
+        "ssub_B": 1,
+        "ring_size_factor": 1.4
+    },
+    "motion": {
+        "pw_rigid": false,
+        "max_shifts": [5, 5],
+        "gSig_filt": [3, 3],
+        "strides": [48, 48],
+        "overlaps": [24, 24],
+        "max_deviation_rigid": 3,
+        "border_nan": "copy"
+    },
+    "preprocess": {
+        "p": 2
+    },
+    "temporal": {
+        "p": 2,
+        "method_deconvolution": "oasis"
+    },
+    "spatial": {
+        "update_background_components": true
+    },
+    "patch": {
+        "rf": null,
+        "stride": null,
+        "only_init": true,
+        "nb_patch": 0,
+        "low_rank_background": null,
+        "del_duplicates": true
+    },
+    "merging": {
+        "merge_thr": 0.7
+    },
+    "quality": {
+        "min_SNR": 2.5,
+        "rval_thr": 0.8,
+        "use_cnn": false
+	}
+}
