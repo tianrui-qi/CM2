@@ -1,5 +1,6 @@
 {
     "data": {
+        "fnames": "data/SUPPORT.tif",
         "fr": 10,
         "decay_time": 1.5,
         "dxy": [2.5, 2.5]
@@ -51,7 +52,7 @@
     },
     "quality": {
         "min_SNR": 2.5,
-        "rval_thr": 0.8,
+        "rval_thr": 0.85,
         "use_cnn": false
 	}
 }

@@ -4,4 +4,3 @@ channels:
   - defaults
 dependencies:
   - caiman=1.12
-  - lightning=2.5
