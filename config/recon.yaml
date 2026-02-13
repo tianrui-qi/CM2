@@ -1,5 +1,5 @@
-load_path: ???
-save_path: ???
+x_load_path: ???
+y_save_path: ???
 frame: [0, -1]
 chunk_size: 32
 queue_size: 2

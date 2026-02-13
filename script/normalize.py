@@ -11,7 +11,7 @@ import zarr
     version_base=None, config_path="../config", config_name="normalize"
 )
 def main(cfg: omegaconf.DictConfig) -> None:
-    with tifffile.TiffFile(cfg.load_path) as tif:
+    with tifffile.TiffFile(cfg.y_load_path) as tif:
         video: zarr.Array = zarr.open(tif.aszarr(), mode="r")
         if video.ndim == 2: video = video[None, ...]
         total_chunks = (
@@ -33,13 +33,15 @@ def main(cfg: omegaconf.DictConfig) -> None:
                 bar.update(1)
 
     same_path = (
-        os.path.abspath(cfg.load_path) == os.path.abspath(cfg.save_path)
+        os.path.abspath(cfg.y_load_path) == os.path.abspath(cfg.y_save_path)
     )
-    if not same_path: tmp_path = cfg.save_path
-    else: tmp_path = cfg.save_path + ".tmp_norm.tif"
+    if not same_path:
+        tmp_path = cfg.y_save_path
+    else:
+        tmp_path = cfg.y_save_path + ".tmp_norm.tif"
     if os.path.exists(tmp_path): os.remove(tmp_path)
 
-    with tifffile.TiffFile(cfg.load_path) as tif:
+    with tifffile.TiffFile(cfg.y_load_path) as tif:
         video: zarr.Array = zarr.open(tif.aszarr(), mode="r")
         if video.ndim == 2: video = video[None, ...]
         total_chunks = (
@@ -66,7 +68,8 @@ def main(cfg: omegaconf.DictConfig) -> None:
                         writer.write(frame, contiguous=True)
                     bar.update(1)
 
-    if same_path: os.replace(tmp_path, cfg.save_path)
+    if same_path:
+        os.replace(tmp_path, cfg.y_save_path)
 
 
 if __name__ == "__main__": main()

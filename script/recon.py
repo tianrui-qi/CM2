@@ -59,7 +59,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
     def desc(name: str) -> str:
         return f"{name:<{desc_width}}"
 
-    with tifffile.TiffFile(cfg.load_path) as tif:
+    with tifffile.TiffFile(cfg.x_load_path) as tif:
         video = zarr.open(tif.aszarr(), mode="r")
         if video.ndim == 2:
             video = video[None, ...]
@@ -211,7 +211,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
         next_chunk_idx = 0
         pipeline_done = False
         try:
-            with tifffile.TiffWriter(cfg.save_path, bigtiff=True) as writer:
+            with tifffile.TiffWriter(cfg.y_save_path, bigtiff=True) as writer:
                 while not pipeline_done:
                     if not errors.empty():
                         raise errors.get()
