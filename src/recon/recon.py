@@ -1,14 +1,16 @@
-import hydra
 import numpy as np
-import omegaconf
 import tifffile
 import time
 import tqdm
 import zarr
+from collections.abc import Mapping, Sequence
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
+from typing import Any
 
-import src
+from .decon import Decon
+from .distort import Distort
+from .stitch import Stitch
 
 
 class ProcBar(tqdm.tqdm):
@@ -28,38 +30,60 @@ class ProcBar(tqdm.tqdm):
         return d
 
 
-@hydra.main(
-    version_base=None, config_path="../config", config_name="recon"
-)
-def main(cfg: omegaconf.DictConfig) -> None:
-    stages: list[tuple[str, object]] = []
-    if cfg.distortion.enable:
-        distortion = src.Distort(**cfg.distortion, dtype=cfg.dtype)
-        stages.append(("distort", distortion.forward))
-    if cfg.decon.enable:
-        decon = src.Decon(**cfg.decon, dtype=cfg.dtype)
-        stages.append(("decon", decon.forward))
-    if cfg.stitch.enable:
-        stitch = src.Stitch(**cfg.stitch, dtype=cfg.dtype)
-        stages.append(("stitch", stitch.forward))
+def _to_plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(k): _to_plain(v) for k, v in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_to_plain(v) for v in value]
+    return value
 
-    queue_size = max(1, int(cfg.get("queue_size", 2)))
-    frame_cfg = cfg.get("frame", [0, -1])
+
+def _to_plain_dict(value: object, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{name} must be a mapping, got {type(value).__name__}")
+    return {str(k): _to_plain(v) for k, v in value.items()}
+
+
+def run(
+    x_load_path: str,
+    y_save_path: str,
+    frame: Sequence[int],
+    chunk_size: int,
+    queue_size: int,
+    dtype: str,
+    distortion: Mapping[str, Any],
+    decon: Mapping[str, Any],
+    stitch: Mapping[str, Any],
+) -> None:
+    distortion_cfg = _to_plain_dict(distortion, "distortion")
+    decon_cfg = _to_plain_dict(decon, "decon")
+    stitch_cfg = _to_plain_dict(stitch, "stitch")
+
+    stages: list[tuple[str, object]] = []
+    if bool(distortion_cfg.get("enable", False)):
+        distortion_stage = Distort(**distortion_cfg, dtype=dtype)
+        stages.append(("distort", distortion_stage.forward))
+    if bool(decon_cfg.get("enable", False)):
+        decon_stage = Decon(**decon_cfg, dtype=dtype)
+        stages.append(("deconvolve", decon_stage.forward))
+    if bool(stitch_cfg.get("enable", False)):
+        stitch_stage = Stitch(**stitch_cfg, dtype=dtype)
+        stages.append(("stitch", stitch_stage.forward))
+
+    queue_size = max(1, int(queue_size))
+    frame_cfg = list(frame)
     if len(frame_cfg) != 2:
         raise ValueError("frame must be [start, end], with end=-1 meaning full range.")
     frame_start = int(frame_cfg[0])
     frame_end_cfg = int(frame_cfg[1])
     sentinel = object()
-    stage_names = ["- read"] + [f"- {name}" for name, _ in stages] + ["- write"]
-    desc_width = max([len("recon")] + [len(n) for n in stage_names])
     stage_bar_format = (
         "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{proc}]"
     )
 
-    def desc(name: str) -> str:
-        return f"{name:<{desc_width}}"
-
-    with tifffile.TiffFile(cfg.x_load_path) as tif:
+    with tifffile.TiffFile(x_load_path) as tif:
         video = zarr.open(tif.aszarr(), mode="r")
         if video.ndim == 2:
             video = video[None, ...]
@@ -77,7 +101,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
             )
 
         total_frames = frame_end - frame_start
-        total_chunks = (total_frames + cfg.chunk_size - 1) // cfg.chunk_size
+        total_chunks = (total_frames + chunk_size - 1) // chunk_size
         queues = [Queue(maxsize=queue_size) for _ in range(len(stages) + 1)]
         stop_event = Event()
         errors: Queue = Queue()
@@ -96,7 +120,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
         recon_bar = ProcBar(
             total=total_chunks,
             unit="chunk",
-            desc=desc("recon"),
+            desc="reconstruct",
             position=0,
             leave=True,
             dynamic_ncols=True,
@@ -105,7 +129,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
         read_bar = ProcBar(
             total=total_chunks,
             unit="chunk",
-            desc=desc("- read"),
+            desc="- read",
             position=1,
             leave=True,
             dynamic_ncols=True,
@@ -117,7 +141,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
             stage_bar = ProcBar(
                 total=total_chunks,
                 unit="chunk",
-                desc=desc(f"- {stage_name}"),
+                desc=f"- {stage_name}",
                 position=i,
                 leave=True,
                 dynamic_ncols=True,
@@ -128,7 +152,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
         write_bar = ProcBar(
             total=total_chunks,
             unit="chunk",
-            desc=desc("- write"),
+            desc="- write",
             position=len(stages) + 2,
             leave=True,
             dynamic_ncols=True,
@@ -152,12 +176,12 @@ def main(cfg: omegaconf.DictConfig) -> None:
 
         def reader() -> None:
             try:
-                for chunk_idx, start in enumerate(range(frame_start, frame_end, cfg.chunk_size)):
+                for chunk_idx, start in enumerate(range(frame_start, frame_end, chunk_size)):
                     if stop_event.is_set():
                         break
-                    end = min(start + cfg.chunk_size, frame_end)
+                    end = min(start + chunk_size, frame_end)
                     t0 = time.perf_counter()
-                    chunk = np.asarray(video[start:end], dtype=cfg.dtype)
+                    chunk = np.asarray(video[start:end], dtype=dtype)
                     dt = time.perf_counter() - t0
                     safe_put(queues[0], (chunk_idx, chunk))
                     read_bar.update(1)
@@ -211,7 +235,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
         next_chunk_idx = 0
         pipeline_done = False
         try:
-            with tifffile.TiffWriter(cfg.y_save_path, bigtiff=True) as writer:
+            with tifffile.TiffWriter(y_save_path, bigtiff=True) as writer:
                 while not pipeline_done:
                     if not errors.empty():
                         raise errors.get()
@@ -225,7 +249,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
                         continue
 
                     chunk_idx, chunk = item
-                    pending[chunk_idx] = np.asarray(chunk, dtype=cfg.dtype)
+                    pending[chunk_idx] = np.asarray(chunk, dtype=dtype)
 
                     while next_chunk_idx in pending:
                         chunk_out = pending.pop(next_chunk_idx)
@@ -267,4 +291,39 @@ def main(cfg: omegaconf.DictConfig) -> None:
             )
 
 
-if __name__ == "__main__": main()
+class Recon:
+    def __init__(
+        self,
+        x_load_path: str,
+        y_save_path: str,
+        frame: Sequence[int],
+        chunk_size: int,
+        queue_size: int,
+        dtype: str,
+        distortion: Mapping[str, Any],
+        decon: Mapping[str, Any],
+        stitch: Mapping[str, Any],
+        **kwargs,
+    ) -> None:
+        self.x_load_path = x_load_path
+        self.y_save_path = y_save_path
+        self.frame = [int(frame[0]), int(frame[1])]
+        self.chunk_size = int(chunk_size)
+        self.queue_size = int(queue_size)
+        self.dtype = str(dtype)
+        self.distortion = _to_plain_dict(distortion, "distortion")
+        self.decon = _to_plain_dict(decon, "decon")
+        self.stitch = _to_plain_dict(stitch, "stitch")
+
+    def forward(self) -> None:
+        run(
+            x_load_path=self.x_load_path,
+            y_save_path=self.y_save_path,
+            frame=self.frame,
+            chunk_size=self.chunk_size,
+            queue_size=self.queue_size,
+            dtype=self.dtype,
+            distortion=self.distortion,
+            decon=self.decon,
+            stitch=self.stitch,
+        )

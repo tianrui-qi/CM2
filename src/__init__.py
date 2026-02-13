@@ -1,9 +1,9 @@
-from .distort import Distort
-from .decon import Decon
-from .stitch import Stitch
+from .recon import Recon
+from .normalize import Normalize
+from .crop import Crop
 
 __all__ = [
-    "Distort",
-    "Decon",
-    "Stitch",
+    "Recon",
+    "Normalize",
+    "Crop",
 ]

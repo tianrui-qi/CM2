@@ -1,13 +1,12 @@
-import importlib.util
 from dataclasses import dataclass
-from pathlib import Path
-
-import hydra
+from collections.abc import Sequence
 import numpy as np
-import omegaconf
+from pathlib import Path
 import tifffile
 import tqdm
 import zarr
+
+from .recon.stitch import Stitch
 
 
 @dataclass(frozen=True)
@@ -56,36 +55,6 @@ def stripe_bounds_center(center: float, limit: int, width: int) -> tuple[int, in
     if right <= left:
         return 0, 0
     return left, right
-
-
-def build_grid_mask(
-    height: int,
-    width: int,
-    tile_size: int,
-    seam_width: int,
-) -> np.ndarray:
-    edge_width = seam_width // 2
-    mask = np.zeros((height, width), dtype=bool)
-
-    # Vertical seams
-    for x in range(tile_size, width, tile_size):
-        left, right = stripe_bounds(x, width, seam_width)
-        mask[:, left:right] = True
-    left, right = stripe_bounds(0, width, edge_width)
-    mask[:, left:right] = True
-    left, right = stripe_bounds(width, width, edge_width)
-    mask[:, left:right] = True
-
-    # Horizontal seams
-    for y in range(tile_size, height, tile_size):
-        top, bottom = stripe_bounds(y, height, seam_width)
-        mask[top:bottom, :] = True
-    top, bottom = stripe_bounds(0, height, edge_width)
-    mask[top:bottom, :] = True
-    top, bottom = stripe_bounds(height, height, edge_width)
-    mask[top:bottom, :] = True
-
-    return mask
 
 
 def paint_quadrant_grid(
@@ -170,17 +139,6 @@ def read_first_frame(path: Path) -> np.ndarray:
     return frame
 
 
-def overlay_grid(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    output = frame.astype(np.float32, copy=True)
-    finite = np.isfinite(output)
-    if np.any(finite):
-        line_value = np.percentile(output[finite], 99.9)
-    else:
-        line_value = 1.0
-    output[mask] = line_value
-    return output
-
-
 def frame_to_rgb(frame: np.ndarray) -> np.ndarray:
     output = frame.astype(np.float32, copy=False)
     finite = np.isfinite(output)
@@ -225,25 +183,12 @@ def overlay_white_lines(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     rgb[mask] = np.asarray((255, 255, 255), dtype=np.uint8)
     return rgb
 
-
-def load_stitch_class():
-    repo_root = Path(__file__).resolve().parents[1]
-    stitch_path = repo_root / "src" / "stitch.py"
-    spec = importlib.util.spec_from_file_location("cm2_stitch_module", stitch_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load stitch module: {stitch_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.Stitch
-
-
 def stitch_image(
     image: np.ndarray,
     match_point_1: tuple[tuple[int, int], tuple[int, int]],
     match_point_2: tuple[tuple[int, int], tuple[int, int]],
     match_point_3: tuple[tuple[int, int], tuple[int, int]],
 ) -> np.ndarray:
-    Stitch = load_stitch_class()
     stitch = Stitch(
         match_point_1=match_point_1,
         match_point_2=match_point_2,
@@ -269,19 +214,19 @@ def stitch_image(
 def parse_match_point(
     values: object, name: str
 ) -> tuple[tuple[int, int], tuple[int, int]]:
-    if isinstance(values, (list, tuple)):
+    if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
         if (
             len(values) == 4
-            and not isinstance(values[0], (list, tuple))
-            and not isinstance(values[1], (list, tuple))
-            and not isinstance(values[2], (list, tuple))
-            and not isinstance(values[3], (list, tuple))
+            and not isinstance(values[0], Sequence)
+            and not isinstance(values[1], Sequence)
+            and not isinstance(values[2], Sequence)
+            and not isinstance(values[3], Sequence)
         ):
             return ((int(values[0]), int(values[1])), (int(values[2]), int(values[3])))
         if (
             len(values) == 2
-            and isinstance(values[0], (list, tuple))
-            and isinstance(values[1], (list, tuple))
+            and isinstance(values[0], Sequence)
+            and isinstance(values[1], Sequence)
             and len(values[0]) == 2
             and len(values[1]) == 2
         ):
@@ -782,16 +727,7 @@ def extract_patches_from_stitched(
                 writer.close()
 
 
-def save_image(path: Path, image: np.ndarray, mode: str) -> None:
-    if mode == "mono":
-        tifffile.imwrite(
-            path,
-            image.astype(np.float32),
-            imagej=True,
-            metadata={"axes": "YX"},
-        )
-        return
-
+def save_image(path: Path, image: np.ndarray) -> None:
     tifffile.imwrite(
         path,
         image.astype(np.uint8, copy=False),
@@ -800,44 +736,49 @@ def save_image(path: Path, image: np.ndarray, mode: str) -> None:
     )
 
 
-def run(cfg: omegaconf.DictConfig) -> None:
-    input_path = Path(cfg.x_load_path)
-    if cfg.y_load_path is None:
+def run(
+    x_load_path: str,
+    y_load_path: str,
+    plot_save_fold: str | None,
+    crop_save_fold: str | None,
+    frame: Sequence[int],
+    chunk_size: int,
+    seam_width: int,
+    tile_size: int,
+    match_point_1: object,
+    match_point_2: object,
+    match_point_3: object,
+    coverage_ratio: float,
+    min_patch_size: int,
+) -> None:
+    input_path = Path(x_load_path)
+    if y_load_path is None:
         raise ValueError("y_load_path must be set.")
-    patch_input = Path(cfg.y_load_path)
+    patch_input = Path(y_load_path)
     plot_dir = (
-        Path(cfg.plot_save_fold)
-        if cfg.plot_save_fold is not None
+        Path(plot_save_fold)
+        if plot_save_fold is not None
         else patch_input.parent / "crop"
     )
     save_path_1 = plot_dir / "1.tif"
     save_path_2 = plot_dir / "2.tif"
     save_path_3 = plot_dir / "3.tif"
 
-    frame = read_first_frame(input_path)
-    h, w = frame.shape
+    first_frame = read_first_frame(input_path)
+    h, w = first_frame.shape
 
     save_path_1.parent.mkdir(parents=True, exist_ok=True)
     save_path_2.parent.mkdir(parents=True, exist_ok=True)
     save_path_3.parent.mkdir(parents=True, exist_ok=True)
-    mp1 = parse_match_point(
-        omegaconf.OmegaConf.to_container(cfg.match_point_1, resolve=True),
-        "match_point_1",
-    )
-    mp2 = parse_match_point(
-        omegaconf.OmegaConf.to_container(cfg.match_point_2, resolve=True),
-        "match_point_2",
-    )
-    mp3 = parse_match_point(
-        omegaconf.OmegaConf.to_container(cfg.match_point_3, resolve=True),
-        "match_point_3",
-    )
-    seam_width = int(cfg.seam_width)
+    mp1 = parse_match_point(match_point_1, "match_point_1")
+    mp2 = parse_match_point(match_point_2, "match_point_2")
+    mp3 = parse_match_point(match_point_3, "match_point_3")
+    seam_width = int(seam_width)
     if seam_width < 2 or seam_width % 2 != 0:
         raise ValueError(
             f"seam_width must be an even integer >= 2, got {seam_width}"
         )
-    tile_size = int(cfg.tile_size)
+    tile_size = int(tile_size)
 
     masks = build_quadrant_masks(
         height=h,
@@ -845,8 +786,8 @@ def run(cfg: omegaconf.DictConfig) -> None:
         tile_size=tile_size,
         seam_width=seam_width,
     )
-    overlay_rgb: np.ndarray = overlay_quadrant_grid(frame, masks)
-    save_image(save_path_1, overlay_rgb, mode="quadrant-rgb")
+    overlay_rgb: np.ndarray = overlay_quadrant_grid(first_frame, masks)
+    save_image(save_path_1, overlay_rgb)
     stitched_rgb = stitch_image(
         image=overlay_rgb,
         match_point_1=mp1,
@@ -861,7 +802,7 @@ def run(cfg: omegaconf.DictConfig) -> None:
         match_point_3=mp3,
         seam_width=seam_width,
     )
-    save_image(save_path_2, stitched_rgb, mode="quadrant-rgb")
+    save_image(save_path_2, stitched_rgb)
 
     with tifffile.TiffFile(patch_input) as tif:
         video = zarr.open(tif.aszarr(), mode="r")
@@ -882,8 +823,8 @@ def run(cfg: omegaconf.DictConfig) -> None:
         match_point_1=mp1,
         match_point_2=mp2,
         match_point_3=mp3,
-        coverage_ratio=float(cfg.coverage_ratio),
-        min_patch_size=int(cfg.min_patch_size),
+        coverage_ratio=float(coverage_ratio),
+        min_patch_size=int(min_patch_size),
     )
     crop_frame = read_first_frame(patch_input)
     if crop_frame.shape != stitched_shape:
@@ -896,16 +837,16 @@ def run(cfg: omegaconf.DictConfig) -> None:
         seam_width=seam_width,
     )
     crop_overlay = overlay_white_lines(crop_frame, crop_mask)
-    save_image(save_path_3, crop_overlay, mode="rgb")
+    save_image(save_path_3, crop_overlay)
 
     output_dir = (
-        Path(cfg.crop_save_fold)
-        if cfg.crop_save_fold is not None
+        Path(crop_save_fold)
+        if crop_save_fold is not None
         else patch_input.with_suffix("")
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    frame_cfg = cfg.frame
+    frame_cfg = frame
     if len(frame_cfg) != 2:
         raise ValueError("frame must be [start, end], end=-1 means full.")
     frame_start = int(frame_cfg[0])
@@ -915,16 +856,57 @@ def run(cfg: omegaconf.DictConfig) -> None:
         stitched_tif=patch_input,
         patch_specs=patch_specs,
         output_dir=output_dir,
-        chunk_size=int(cfg.chunk_size),
+        chunk_size=int(chunk_size),
         frame_start=frame_start,
         frame_end=frame_end,
     )
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="crop")
-def main(cfg: omegaconf.DictConfig) -> None:
-    run(cfg)
+class Crop:
+    def __init__(
+        self,
+        x_load_path: str,
+        y_load_path: str,
+        plot_save_fold: str | None,
+        crop_save_fold: str | None,
+        frame: Sequence[int],
+        chunk_size: int,
+        seam_width: int,
+        tile_size: int,
+        match_point_1: object,
+        match_point_2: object,
+        match_point_3: object,
+        coverage_ratio: float,
+        min_patch_size: int,
+        **kwargs,
+    ) -> None:
+        self.x_load_path = x_load_path
+        self.y_load_path = y_load_path
+        self.plot_save_fold = plot_save_fold
+        self.crop_save_fold = crop_save_fold
+        self.frame = list(frame)
+        self.chunk_size = int(chunk_size)
+        self.seam_width = int(seam_width)
+        self.tile_size = int(tile_size)
+        self.match_point_1 = match_point_1
+        self.match_point_2 = match_point_2
+        self.match_point_3 = match_point_3
+        self.coverage_ratio = float(coverage_ratio)
+        self.min_patch_size = int(min_patch_size)
 
-
-if __name__ == "__main__":
-    main()
+    def forward(self) -> None:
+        run(
+            x_load_path=self.x_load_path,
+            y_load_path=self.y_load_path,
+            plot_save_fold=self.plot_save_fold,
+            crop_save_fold=self.crop_save_fold,
+            frame=self.frame,
+            chunk_size=self.chunk_size,
+            seam_width=self.seam_width,
+            tile_size=self.tile_size,
+            match_point_1=self.match_point_1,
+            match_point_2=self.match_point_2,
+            match_point_3=self.match_point_3,
+            coverage_ratio=self.coverage_ratio,
+            min_patch_size=self.min_patch_size,
+        )

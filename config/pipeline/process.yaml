@@ -1,0 +1,29 @@
+# @package _global_
+
+defaults:
+  - /schema/recon@_here_
+  - /schema/normalize@_here_
+  - /schema/crop@_here_
+  - _self_
+
+x_path: ???
+y_path: ???
+chunk_size: 32
+
+recon:
+  enable: true
+  x_load_path: ${x_path}
+  y_save_path: ${y_path}
+  chunk_size: ${chunk_size}
+
+normalize:
+  enable: true
+  y_load_path: ${y_path}
+  y_save_path: ${y_path}
+  chunk_size: ${chunk_size}
+
+crop:
+  enable: true
+  x_load_path: ${x_path}
+  y_load_path: ${y_path}
+  chunk_size: ${chunk_size}

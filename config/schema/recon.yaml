@@ -1,0 +1,38 @@
+recon:
+  x_load_path: ???
+  y_save_path: ???
+  frame: [0, -1]
+  chunk_size: 32
+  queue_size: 2
+  dtype: float32
+  # distortion correction
+  distortion:
+    enable: true
+    flatfield_path: data/recon/cm2_flatfield_correction.tif
+    prepared_data_path: data/recon/prepared_data_20250804_002501.mat
+    xd_key: xd_img_sub
+    yd_key: yd_img_sub
+  # deconvolution
+  decon:
+    enable: true
+    enable_gpu: true
+    prepared_data_path: data/recon/prepared_data_20250804_002501.mat
+    psf_key: psfs_denoised
+    patch_center_key: undistorted_points
+    marker_index_local:
+      - [13, 10]
+      - [11, 10]
+      - [11, 8]
+      - [13, 8]
+    lambda_value: 0.0206913808111479
+    mode: patch
+    edge_protection: 40
+    overlap: 40
+    brightness_matching: false
+  # stitching
+  stitch:
+    enable: true
+    match_point_1: [[1884, 895], [292, 891]]
+    match_point_2: [[1623, 895], [91, 908]]
+    match_point_3: [[1264, 1277], [1234, 72]]
+    match_brightness: false

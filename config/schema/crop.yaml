@@ -1,0 +1,17 @@
+crop:
+  x_load_path: ???
+  y_load_path: ???
+  plot_save_fold: null
+  crop_save_fold: null
+  frame: [0, -1]
+  chunk_size: 32
+  # plot
+  seam_width: 4
+  # patching
+  tile_size: 250
+  match_point_1: [[1884, 895], [292, 891]]
+  match_point_2: [[1623, 895], [91, 908]]
+  match_point_3: [[1264, 1277], [1234, 72]]
+  # patch filter
+  coverage_ratio: 0.5
+  min_patch_size: 50
