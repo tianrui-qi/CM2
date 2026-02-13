@@ -3,4 +3,5 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - caiman=1.12
+  - caiman
+  - hydra-core

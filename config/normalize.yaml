@@ -1,0 +1,4 @@
+load_path: ???
+save_path: ???
+chunk_size: 32
+dtype: float32
