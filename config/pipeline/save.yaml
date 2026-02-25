@@ -1,0 +1,17 @@
+# @package _global_
+
+x_load_path: ???
+y_load_path: null       # default: [parent of x_load_path]/Y.tif
+model_load_fold: null   # default: [parent of y_load_path]/model
+save_fold: null         # default: [parent of y_load_path]/save
+chunk_size: 32
+# crop
+seam_width: 4
+tile_size: 500
+match_point_1: [[1884, 895], [292, 891]]
+match_point_2: [[1623, 895], [91, 908]]
+match_point_3: [[1264, 1277], [1234, 72]]
+coverage_ratio: 0.5
+min_patch_size: 40
+# downsample
+downsample_factor: 2
