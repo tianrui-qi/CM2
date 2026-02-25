@@ -4,10 +4,11 @@ defaults:
   - /schema/recon@_here_
   - /schema/normalize@_here_
   - /schema/crop@_here_
+  - /schema/extract@_here_
   - _self_
 
 x_path: ???
-y_path: ???
+y_path: null  # default: [parent of x_load_path]/Y.tif
 chunk_size: 32
 
 recon:
@@ -27,3 +28,7 @@ crop:
   x_load_path: ${x_path}
   y_load_path: ${y_path}
   chunk_size: ${chunk_size}
+
+extract:
+  enable: true
+  y_load_fold: ${crop.y_save_fold}

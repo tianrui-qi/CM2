@@ -664,6 +664,7 @@ def extract_patches_from_stitched(
     chunk_size: int,
     frame_start: int,
     frame_end: int,
+    pad: int,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -695,6 +696,8 @@ def extract_patches_from_stitched(
             )
         if chunk_size <= 0:
             raise ValueError("chunk_size must be > 0")
+        if pad < 0:
+            raise ValueError("pad must be >= 0")
 
         writers: dict[str, tifffile.TiffWriter] = {}
         try:
@@ -713,7 +716,30 @@ def extract_patches_from_stitched(
                     end = min(start + chunk_size, frame_end)
                     chunk = np.asarray(video[start:end])
                     for spec in patch_specs:
-                        sub = chunk[:, spec.y0 : spec.y1, spec.x0 : spec.x1]
+                        if pad == 0:
+                            sub = chunk[:, spec.y0 : spec.y1, spec.x0 : spec.x1]
+                        else:
+                            out_h = (spec.y1 - spec.y0) + 2 * pad
+                            out_w = (spec.x1 - spec.x0) + 2 * pad
+                            sub = np.zeros(
+                                (chunk.shape[0], out_h, out_w),
+                                dtype=chunk.dtype,
+                            )
+                            sy0_req = spec.y0 - pad
+                            sy1_req = spec.y1 + pad
+                            sx0_req = spec.x0 - pad
+                            sx1_req = spec.x1 + pad
+
+                            sy0 = max(0, sy0_req)
+                            sy1 = min(h, sy1_req)
+                            sx0 = max(0, sx0_req)
+                            sx1 = min(w, sx1_req)
+
+                            dy0 = sy0 - sy0_req
+                            dx0 = sx0 - sx0_req
+                            dy1 = dy0 + (sy1 - sy0)
+                            dx1 = dx0 + (sx1 - sx0)
+                            sub[:, dy0:dy1, dx0:dx1] = chunk[:, sy0:sy1, sx0:sx1]
                         writer = writers[spec.name]
                         for frame in sub:
                             writer.write(
@@ -739,8 +765,7 @@ def save_image(path: Path, image: np.ndarray) -> None:
 def run(
     x_load_path: str,
     y_load_path: str,
-    plot_save_fold: str | None,
-    crop_save_fold: str | None,
+    y_save_fold: str | None,
     frame: Sequence[int],
     chunk_size: int,
     seam_width: int,
@@ -750,26 +775,16 @@ def run(
     match_point_3: object,
     coverage_ratio: float,
     min_patch_size: int,
+    pad: int,
 ) -> None:
     input_path = Path(x_load_path)
     if y_load_path is None:
         raise ValueError("y_load_path must be set.")
     patch_input = Path(y_load_path)
-    plot_dir = (
-        Path(plot_save_fold)
-        if plot_save_fold is not None
-        else patch_input.parent / "crop"
-    )
-    save_path_1 = plot_dir / "1.tif"
-    save_path_2 = plot_dir / "2.tif"
-    save_path_3 = plot_dir / "3.tif"
 
     first_frame = read_first_frame(input_path)
     h, w = first_frame.shape
 
-    save_path_1.parent.mkdir(parents=True, exist_ok=True)
-    save_path_2.parent.mkdir(parents=True, exist_ok=True)
-    save_path_3.parent.mkdir(parents=True, exist_ok=True)
     mp1 = parse_match_point(match_point_1, "match_point_1")
     mp2 = parse_match_point(match_point_2, "match_point_2")
     mp3 = parse_match_point(match_point_3, "match_point_3")
@@ -779,30 +794,6 @@ def run(
             f"seam_width must be an even integer >= 2, got {seam_width}"
         )
     tile_size = int(tile_size)
-
-    masks = build_quadrant_masks(
-        height=h,
-        width=w,
-        tile_size=tile_size,
-        seam_width=seam_width,
-    )
-    overlay_rgb: np.ndarray = overlay_quadrant_grid(first_frame, masks)
-    save_image(save_path_1, overlay_rgb)
-    stitched_rgb = stitch_image(
-        image=overlay_rgb,
-        match_point_1=mp1,
-        match_point_2=mp2,
-        match_point_3=mp3,
-    )
-    stitched_rgb = add_midpoint_stitch_seams(
-        stitched=stitched_rgb,
-        input_shape=(h, w),
-        match_point_1=mp1,
-        match_point_2=mp2,
-        match_point_3=mp3,
-        seam_width=seam_width,
-    )
-    save_image(save_path_2, stitched_rgb)
 
     with tifffile.TiffFile(patch_input) as tif:
         video = zarr.open(tif.aszarr(), mode="r")
@@ -826,22 +817,10 @@ def run(
         coverage_ratio=float(coverage_ratio),
         min_patch_size=int(min_patch_size),
     )
-    crop_frame = read_first_frame(patch_input)
-    if crop_frame.shape != stitched_shape:
-        raise ValueError(
-            f"Crop frame shape mismatch: got {crop_frame.shape}, expected {stitched_shape}"
-        )
-    crop_mask = build_patch_boundary_mask(
-        stitched_shape=stitched_shape,
-        patch_specs=patch_specs,
-        seam_width=seam_width,
-    )
-    crop_overlay = overlay_white_lines(crop_frame, crop_mask)
-    save_image(save_path_3, crop_overlay)
 
     output_dir = (
-        Path(crop_save_fold)
-        if crop_save_fold is not None
+        Path(y_save_fold)
+        if y_save_fold is not None
         else patch_input.with_suffix("")
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -859,6 +838,7 @@ def run(
         chunk_size=int(chunk_size),
         frame_start=frame_start,
         frame_end=frame_end,
+        pad=int(pad),
     )
 
 
@@ -867,8 +847,7 @@ class Crop:
         self,
         x_load_path: str,
         y_load_path: str,
-        plot_save_fold: str | None,
-        crop_save_fold: str | None,
+        y_save_fold: str | None,
         frame: Sequence[int],
         chunk_size: int,
         seam_width: int,
@@ -878,12 +857,12 @@ class Crop:
         match_point_3: object,
         coverage_ratio: float,
         min_patch_size: int,
+        pad: int,
         **kwargs,
     ) -> None:
         self.x_load_path = x_load_path
         self.y_load_path = y_load_path
-        self.plot_save_fold = plot_save_fold
-        self.crop_save_fold = crop_save_fold
+        self.y_save_fold = y_save_fold
         self.frame = list(frame)
         self.chunk_size = int(chunk_size)
         self.seam_width = int(seam_width)
@@ -893,13 +872,13 @@ class Crop:
         self.match_point_3 = match_point_3
         self.coverage_ratio = float(coverage_ratio)
         self.min_patch_size = int(min_patch_size)
+        self.pad = int(pad)
 
     def forward(self) -> None:
         run(
             x_load_path=self.x_load_path,
             y_load_path=self.y_load_path,
-            plot_save_fold=self.plot_save_fold,
-            crop_save_fold=self.crop_save_fold,
+            y_save_fold=self.y_save_fold,
             frame=self.frame,
             chunk_size=self.chunk_size,
             seam_width=self.seam_width,
@@ -909,4 +888,5 @@ class Crop:
             match_point_3=self.match_point_3,
             coverage_ratio=self.coverage_ratio,
             min_patch_size=self.min_patch_size,
+            pad=self.pad,
         )
