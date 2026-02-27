@@ -1,6 +1,9 @@
 from dataclasses import dataclass
+from collections.abc import Sequence
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -252,6 +255,259 @@ def _prepare_patch_downsample_slices(p: PatchMeta, factor: int) -> None:
     p.ds_x1 = p.ds_x0 + w_ds
 
 
+def _get_available_memory_bytes() -> int | None:
+    try:
+        import psutil  # type: ignore
+
+        avail = int(psutil.virtual_memory().available)
+        if avail > 0:
+            return avail
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            if ok:
+                avail = int(stat.ullAvailPhys)
+                if avail > 0:
+                    return avail
+        except Exception:
+            pass
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        avail_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        avail = page_size * avail_pages
+        if avail > 0:
+            return avail
+    except Exception:
+        return None
+    return None
+
+
+def _estimate_worker_memory_bytes(
+    patches: list[PatchMeta],
+    model_chunk: int,
+) -> int:
+    if not patches:
+        return 1 << 30
+    float_bytes = np.dtype(np.float32).itemsize
+    max_pixels = max(p.h * p.w for p in patches)
+    max_model_bytes = max(int(p.model_path.stat().st_size) for p in patches)
+    dense_work = max_pixels * model_chunk * float_bytes * 6
+    frame_buffers = max_pixels * float_bytes * 6
+    model_overhead = int(max_model_bytes * 5 // 2)
+    fixed_overhead = 512 * 1024 * 1024
+    estimate = dense_work + frame_buffers + model_overhead + fixed_overhead
+    return max(256 * 1024 * 1024, estimate)
+
+
+def _resolve_parallel_workers(
+    patches: list[PatchMeta],
+    model_chunk: int,
+    requested_workers: int | None,
+    memory_usage_fraction: float,
+) -> int:
+    if not patches:
+        return 1
+    cpu_total = max(1, os.cpu_count() or 1)
+    cpu_cap = max(1, cpu_total - 1)
+
+    if requested_workers is not None:
+        req = int(requested_workers)
+        if req <= 0:
+            raise ValueError(f"model_workers must be > 0 when set, got {req}")
+        target = min(req, cpu_cap)
+    else:
+        target = cpu_cap
+
+    frac = float(memory_usage_fraction)
+    if not (0.1 <= frac <= 0.95):
+        raise ValueError(
+            f"model_memory_fraction must be in [0.1, 0.95], got {memory_usage_fraction}"
+        )
+
+    avail_bytes = _get_available_memory_bytes()
+    memory_cap = len(patches)
+    if avail_bytes is not None:
+        worker_mem = _estimate_worker_memory_bytes(patches, model_chunk)
+        budget = int(avail_bytes * frac)
+        if budget <= 0:
+            memory_cap = 1
+        else:
+            memory_cap = max(1, budget // max(worker_mem, 1))
+
+    workers = min(len(patches), target, memory_cap)
+    return max(1, workers)
+
+
+def _process_single_patch_to_temp(
+    p: PatchMeta,
+    tmp_dir: Path,
+    factor: int,
+    model_chunk: int,
+    bf_name: str,
+    b_name: str,
+    ac_name: str,
+) -> tuple[str, int]:
+    from caiman.source_extraction.cnmf.cnmf import load_CNMF
+
+    logging.getLogger("caiman").setLevel(logging.ERROR)
+    patch_dir = tmp_dir / p.patch_name
+    patch_dir.mkdir(parents=True, exist_ok=True)
+
+    cnm = load_CNMF(str(p.model_path), n_processes=1, dview=None)
+    dims = tuple(int(x) for x in list(cnm.dims)[:2])
+    if dims != (p.h, p.w):
+        raise ValueError(
+            f"Movie/model dims mismatch for {p.patch_name}: movie={(p.h, p.w)}, model={dims}"
+        )
+
+    A = cnm.estimates.A.tocsr()
+    C = np.asarray(cnm.estimates.C, dtype=np.float32)
+    if C.ndim != 2:
+        raise ValueError(f"Expected C as 2D matrix, got shape={C.shape}")
+    if A.shape[0] != p.h * p.w or A.shape[1] != C.shape[0]:
+        raise ValueError(
+            f"A/C shape mismatch for {p.patch_name}: A={A.shape}, C={C.shape}"
+        )
+
+    b0_raw = getattr(cnm.estimates, "b0", None)
+    if b0_raw is None:
+        raise ValueError(f"Model has no b0 for {p.patch_name}: {p.model_path}")
+    b0 = np.asarray(b0_raw, dtype=np.float32).reshape(-1)
+    if b0.size != p.h * p.w:
+        raise ValueError(
+            f"b0 size mismatch for {p.patch_name}: {b0.size} vs {p.h * p.w}"
+        )
+
+    W = getattr(cnm.estimates, "W", None)
+    if W is None:
+        raise ValueError(f"Model has no W for {p.patch_name}: {p.model_path}")
+
+    t_use = min(p.t, int(C.shape[1]))
+    if t_use <= 0:
+        raise ValueError(f"No valid frames for patch: {p.patch_name}")
+
+    bc_patch = b0.reshape((p.h, p.w), order="F").astype(np.float32, copy=False)
+    asum_patch = np.asarray(A.sum(axis=1), dtype=np.float32).reshape(-1)
+    asum_patch = asum_patch.reshape((p.h, p.w), order="F").astype(
+        np.float32, copy=False
+    )
+    csum = C[:, :t_use].sum(axis=1, dtype=np.float32)
+    acsum_patch = np.asarray(A @ csum, dtype=np.float32).reshape(-1)
+    acsum_patch = acsum_patch.reshape((p.h, p.w), order="F").astype(
+        np.float32, copy=False
+    )
+    bc_core = bc_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
+    asum_core = asum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
+    acsum_core = acsum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
+    bc_down = bc_patch[
+        p.ds_ly0 : p.core_ly1 : factor,
+        p.ds_lx0 : p.core_lx1 : factor,
+    ]
+
+    tifffile.imwrite(
+        patch_dir / "Bc.tif", bc_core, imagej=True, metadata={"axes": "YX"}
+    )
+    tifffile.imwrite(
+        patch_dir / "Asum.tif",
+        asum_core,
+        imagej=True,
+        metadata={"axes": "YX"},
+    )
+    tifffile.imwrite(
+        patch_dir / "ACsum.tif",
+        acsum_core,
+        imagej=True,
+        metadata={"axes": "YX"},
+    )
+
+    with tifffile.TiffFile(p.movie_path) as tif:
+        video = zarr.open(tif.aszarr(), mode="r")
+        if video.ndim != 3:
+            raise ValueError(f"Patch movie must be TYX, got ndim={video.ndim}: {p.movie_path}")
+        if int(video.shape[0]) < t_use:
+            raise ValueError(
+                f"Patch movie shorter than expected for {p.patch_name}: {video.shape[0]} < {t_use}"
+            )
+
+        with tifffile.TiffWriter(
+            patch_dir / bf_name,
+            bigtiff=True,
+        ) as writer_bf, tifffile.TiffWriter(
+            patch_dir / b_name,
+            bigtiff=True,
+        ) as writer_b, tifffile.TiffWriter(
+            patch_dir / ac_name,
+            bigtiff=True,
+        ) as writer_ac:
+            for start in range(0, t_use, model_chunk):
+                end = min(start + model_chunk, t_use)
+                tc = end - start
+                block = np.asarray(video[start:end], dtype=np.float32)
+                y_mat = np.transpose(block, (1, 2, 0)).reshape(
+                    (p.h * p.w, tc), order="F"
+                )
+
+                c_chunk = C[:, start:end]
+                ac_mat = np.asarray(A @ c_chunk, dtype=np.float32)
+                residual = y_mat - ac_mat - b0[:, None]
+                bf_mat = np.asarray(W @ residual, dtype=np.float32)
+
+                ac_frames = ac_mat.T.reshape((tc, p.h, p.w), order="F")
+                bf_frames = bf_mat.T.reshape((tc, p.h, p.w), order="F")
+
+                ac_down = ac_frames[
+                    :,
+                    p.ds_ly0 : p.core_ly1 : factor,
+                    p.ds_lx0 : p.core_lx1 : factor,
+                ]
+                bf_down = bf_frames[
+                    :,
+                    p.ds_ly0 : p.core_ly1 : factor,
+                    p.ds_lx0 : p.core_lx1 : factor,
+                ]
+                b_down = bf_down + bc_down[None, :, :]
+
+                for i in range(tc):
+                    writer_bf.write(
+                        bf_down[i].astype(np.float32, copy=False),
+                        contiguous=True,
+                        photometric="minisblack",
+                    )
+                    writer_b.write(
+                        b_down[i].astype(np.float32, copy=False),
+                        contiguous=True,
+                        photometric="minisblack",
+                    )
+                    writer_ac.write(
+                        ac_down[i].astype(np.float32, copy=False),
+                        contiguous=True,
+                        photometric="minisblack",
+                    )
+
+    return p.patch_name, int(t_use)
+
+
 def _stitch_video_from_temp(
     patches: list[PatchMeta],
     tmp_root: Path,
@@ -300,12 +556,15 @@ def save_model_products_stitched(
     save_dir: Path,
     downsample_factor: int,
     chunk_size: int,
+    model_workers: int | None,
+    model_memory_fraction: float,
 ) -> None:
-    from caiman.source_extraction.cnmf.cnmf import load_CNMF
-
     factor = int(downsample_factor)
     if factor <= 0:
         raise ValueError(f"downsample_factor must be > 0, got {factor}")
+    bf_name = "Bf.tif" if factor == 1 else f"Bf-d{factor}.tif"
+    b_name = "B.tif" if factor == 1 else f"B-d{factor}.tif"
+    ac_name = "AC.tif" if factor == 1 else f"AC-d{factor}.tif"
     chunk = int(chunk_size)
     if chunk <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk}")
@@ -364,139 +623,50 @@ def save_model_products_stitched(
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="save_model_tmp_", dir=save_dir))
     try:
+        workers = _resolve_parallel_workers(
+            patches=patches,
+            model_chunk=model_chunk,
+            requested_workers=model_workers,
+            memory_usage_fraction=float(model_memory_fraction),
+        )
+
         # Phase 1: compute each patch result and save locally (memory-friendly).
+        t_use_by_patch: dict[str, int] = {}
+        if workers <= 1:
+            for p in patches:
+                patch_name, t_use = _process_single_patch_to_temp(
+                    p=p,
+                    tmp_dir=tmp_dir,
+                    factor=factor,
+                    model_chunk=model_chunk,
+                    bf_name=bf_name,
+                    b_name=b_name,
+                    ac_name=ac_name,
+                )
+                t_use_by_patch[patch_name] = t_use
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(
+                        _process_single_patch_to_temp,
+                        p,
+                        tmp_dir,
+                        factor,
+                        model_chunk,
+                        bf_name,
+                        b_name,
+                        ac_name,
+                    )
+                    for p in patches
+                ]
+                for future in as_completed(futures):
+                    patch_name, t_use = future.result()
+                    t_use_by_patch[patch_name] = t_use
+
         for p in patches:
-            patch_dir = tmp_dir / p.patch_name
-            patch_dir.mkdir(parents=True, exist_ok=True)
-            cnm = load_CNMF(str(p.model_path), n_processes=1, dview=None)
-            dims = tuple(int(x) for x in list(cnm.dims)[:2])
-            if dims != (p.h, p.w):
-                raise ValueError(
-                    f"Movie/model dims mismatch for {p.patch_name}: movie={(p.h, p.w)}, model={dims}"
-                )
-
-            A = cnm.estimates.A.tocsr()
-            C = np.asarray(cnm.estimates.C, dtype=np.float32)
-            if C.ndim != 2:
-                raise ValueError(f"Expected C as 2D matrix, got shape={C.shape}")
-            if A.shape[0] != p.h * p.w or A.shape[1] != C.shape[0]:
-                raise ValueError(
-                    f"A/C shape mismatch for {p.patch_name}: A={A.shape}, C={C.shape}"
-                )
-
-            b0_raw = getattr(cnm.estimates, "b0", None)
-            if b0_raw is None:
-                raise ValueError(f"Model has no b0 for {p.patch_name}: {p.model_path}")
-            b0 = np.asarray(b0_raw, dtype=np.float32).reshape(-1)
-            if b0.size != p.h * p.w:
-                raise ValueError(
-                    f"b0 size mismatch for {p.patch_name}: {b0.size} vs {p.h * p.w}"
-                )
-
-            W = getattr(cnm.estimates, "W", None)
-            if W is None:
-                raise ValueError(f"Model has no W for {p.patch_name}: {p.model_path}")
-
-            t_use = min(p.t, int(C.shape[1]))
-            if t_use <= 0:
-                raise ValueError(f"No valid frames for patch: {p.patch_name}")
-            p.t = t_use
-
-            bc_patch = b0.reshape((p.h, p.w), order="F").astype(np.float32, copy=False)
-            asum_patch = np.asarray(A.sum(axis=1), dtype=np.float32).reshape(-1)
-            asum_patch = asum_patch.reshape((p.h, p.w), order="F").astype(
-                np.float32, copy=False
-            )
-            csum = C[:, :t_use].sum(axis=1, dtype=np.float32)
-            acsum_patch = np.asarray(A @ csum, dtype=np.float32).reshape(-1)
-            acsum_patch = acsum_patch.reshape((p.h, p.w), order="F").astype(
-                np.float32, copy=False
-            )
-            bc_core = bc_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-            asum_core = asum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-            acsum_core = acsum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-            bc_down = bc_patch[
-                p.ds_ly0 : p.core_ly1 : factor,
-                p.ds_lx0 : p.core_lx1 : factor,
-            ]
-            tifffile.imwrite(patch_dir / "Bc.tif", bc_core, imagej=True, metadata={"axes": "YX"})
-            tifffile.imwrite(
-                patch_dir / "Asum.tif",
-                asum_core,
-                imagej=True,
-                metadata={"axes": "YX"},
-            )
-            tifffile.imwrite(
-                patch_dir / "ACsum.tif",
-                acsum_core,
-                imagej=True,
-                metadata={"axes": "YX"},
-            )
-
-            with tifffile.TiffFile(p.movie_path) as tif:
-                video = zarr.open(tif.aszarr(), mode="r")
-                if video.ndim != 3:
-                    raise ValueError(
-                        f"Patch movie must be TYX, got ndim={video.ndim}: {p.movie_path}"
-                    )
-                if int(video.shape[0]) < t_use:
-                    raise ValueError(
-                        f"Patch movie shorter than expected for {p.patch_name}: {video.shape[0]} < {t_use}"
-                    )
-                with tifffile.TiffWriter(
-                    patch_dir / f"Bf-d{factor}.tif",
-                    bigtiff=True,
-                ) as writer_bf, tifffile.TiffWriter(
-                    patch_dir / f"B-d{factor}.tif",
-                    bigtiff=True,
-                ) as writer_b, tifffile.TiffWriter(
-                    patch_dir / f"AC-d{factor}.tif",
-                    bigtiff=True,
-                ) as writer_ac:
-                    for start in range(0, t_use, model_chunk):
-                        end = min(start + model_chunk, t_use)
-                        tc = end - start
-                        block = np.asarray(video[start:end], dtype=np.float32)
-                        y_mat = np.transpose(block, (1, 2, 0)).reshape(
-                            (p.h * p.w, tc), order="F"
-                        )
-
-                        c_chunk = C[:, start:end]
-                        ac_mat = np.asarray(A @ c_chunk, dtype=np.float32)
-                        residual = y_mat - ac_mat - b0[:, None]
-                        bf_mat = np.asarray(W @ residual, dtype=np.float32)
-
-                        ac_frames = ac_mat.T.reshape((tc, p.h, p.w), order="F")
-                        bf_frames = bf_mat.T.reshape((tc, p.h, p.w), order="F")
-
-                        ac_down = ac_frames[
-                            :,
-                            p.ds_ly0 : p.core_ly1 : factor,
-                            p.ds_lx0 : p.core_lx1 : factor,
-                        ]
-                        bf_down = bf_frames[
-                            :,
-                            p.ds_ly0 : p.core_ly1 : factor,
-                            p.ds_lx0 : p.core_lx1 : factor,
-                        ]
-                        b_down = bf_down + bc_down[None, :, :]
-
-                        for i in range(tc):
-                            writer_bf.write(
-                                bf_down[i].astype(np.float32, copy=False),
-                                contiguous=True,
-                                photometric="minisblack",
-                            )
-                            writer_b.write(
-                                b_down[i].astype(np.float32, copy=False),
-                                contiguous=True,
-                                photometric="minisblack",
-                            )
-                            writer_ac.write(
-                                ac_down[i].astype(np.float32, copy=False),
-                                contiguous=True,
-                                photometric="minisblack",
-                            )
+            if p.patch_name not in t_use_by_patch:
+                raise RuntimeError(f"Missing t_use result for patch: {p.patch_name}")
+            p.t = int(t_use_by_patch[p.patch_name])
 
         # Phase 2: stitch all patch results into final full-FOV outputs.
         global_t = min(p.t for p in patches)
@@ -525,8 +695,8 @@ def save_model_products_stitched(
         _stitch_video_from_temp(
             patches=patches,
             tmp_root=tmp_dir,
-            patch_video_name=f"Bf-d{factor}.tif",
-            out_path=save_dir / f"Bf-d{factor}.tif",
+            patch_video_name=bf_name,
+            out_path=save_dir / bf_name,
             full_h_ds=full_h_ds,
             full_w_ds=full_w_ds,
             global_t=global_t,
@@ -534,8 +704,8 @@ def save_model_products_stitched(
         _stitch_video_from_temp(
             patches=patches,
             tmp_root=tmp_dir,
-            patch_video_name=f"B-d{factor}.tif",
-            out_path=save_dir / f"B-d{factor}.tif",
+            patch_video_name=b_name,
+            out_path=save_dir / b_name,
             full_h_ds=full_h_ds,
             full_w_ds=full_w_ds,
             global_t=global_t,
@@ -543,8 +713,8 @@ def save_model_products_stitched(
         _stitch_video_from_temp(
             patches=patches,
             tmp_root=tmp_dir,
-            patch_video_name=f"AC-d{factor}.tif",
-            out_path=save_dir / f"AC-d{factor}.tif",
+            patch_video_name=ac_name,
+            out_path=save_dir / ac_name,
             full_h_ds=full_h_ds,
             full_w_ds=full_w_ds,
             global_t=global_t,
@@ -609,12 +779,38 @@ def save_downsampled_tif(
                     )
 
 
+def normalize_downsample_factors(raw: object) -> list[int]:
+    if isinstance(raw, (int, np.integer)):
+        factors = [int(raw)]
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        factors = [int(x) for x in raw]
+    else:
+        raise ValueError(
+            "downsample_factor must be an integer or a list of integers, "
+            f"got {type(raw).__name__}"
+        )
+
+    if not factors:
+        raise ValueError("downsample_factor list cannot be empty.")
+
+    unique: list[int] = []
+    seen: set[int] = set()
+    for f in factors:
+        if f <= 0:
+            raise ValueError(f"downsample_factor values must be > 0, got {f}")
+        if f in seen:
+            continue
+        seen.add(f)
+        unique.append(f)
+    return unique
+
+
 def run(
     x_load_path: str,
     y_load_path: str,
     model_load_fold: str | None,
     save_fold: str | None,
-    downsample_factor: int,
+    downsample_factor: object,
     chunk_size: int,
     seam_width: int,
     tile_size: int,
@@ -623,6 +819,8 @@ def run(
     match_point_3: object,
     coverage_ratio: float,
     min_patch_size: int,
+    model_workers: int | None = None,
+    model_memory_fraction: float = 0.55,
 ) -> None:
     input_path = Path(x_load_path)
     y_input_path = Path(y_load_path)
@@ -633,14 +831,13 @@ def run(
     )
     x_base = input_path.with_suffix("").name
     y_base = y_input_path.with_suffix("").name
+    downsample_factors = normalize_downsample_factors(downsample_factor)
     save_path_1 = plot_dir / "crop-1.tif"
     save_path_2 = plot_dir / "crop-2.tif"
     save_path_3 = plot_dir / "crop-3.tif"
     save_path_4 = plot_dir / "crop-4.tif"
     save_path_first_frame_x = plot_dir / f"{x_base}-f0.tif"
     save_path_first_frame_y = plot_dir / f"{y_base}-f0.tif"
-    save_path_downsample_x = plot_dir / f"{x_base}-d{int(downsample_factor)}.tif"
-    save_path_downsample_y = plot_dir / f"{y_base}-d{int(downsample_factor)}.tif"
 
     first_frame = read_first_frame(input_path)
     first_frame_y = read_first_frame(y_input_path)
@@ -716,26 +913,33 @@ def run(
     save_image(save_path_4, seam_only)
     tifffile.imwrite(save_path_first_frame_x, first_frame)
     tifffile.imwrite(save_path_first_frame_y, first_frame_y)
-    save_downsampled_tif(
-        x_path=input_path,
-        out_path=save_path_downsample_x,
-        downsample_factor=int(downsample_factor),
-        chunk_size=int(chunk_size),
-    )
-    save_downsampled_tif(
-        x_path=y_input_path,
-        out_path=save_path_downsample_y,
-        downsample_factor=int(downsample_factor),
-        chunk_size=int(chunk_size),
-    )
-    save_model_products_stitched(
-        y_load_path=y_input_path,
-        model_load_fold_cfg=model_load_fold,
-        core_specs=core_specs,
-        save_dir=plot_dir, 
-        downsample_factor=int(downsample_factor),
-        chunk_size=int(chunk_size),
-    )
+    for factor in downsample_factors:
+        if factor > 1:
+            save_path_downsample_x = plot_dir / f"{x_base}-d{factor}.tif"
+            save_path_downsample_y = plot_dir / f"{y_base}-d{factor}.tif"
+            save_downsampled_tif(
+                x_path=input_path,
+                out_path=save_path_downsample_x,
+                downsample_factor=factor,
+                chunk_size=int(chunk_size),
+            )
+            save_downsampled_tif(
+                x_path=y_input_path,
+                out_path=save_path_downsample_y,
+                downsample_factor=factor,
+                chunk_size=int(chunk_size),
+            )
+
+        save_model_products_stitched(
+            y_load_path=y_input_path,
+            model_load_fold_cfg=model_load_fold,
+            core_specs=core_specs,
+            save_dir=plot_dir,
+            downsample_factor=factor,
+            chunk_size=int(chunk_size),
+            model_workers=model_workers,
+            model_memory_fraction=float(model_memory_fraction),
+        )
 
 
 class Save:
@@ -745,7 +949,7 @@ class Save:
         y_load_path: str,
         model_load_fold: str | None,
         save_fold: str | None,
-        downsample_factor: int,
+        downsample_factor: object,
         chunk_size: int,
         seam_width: int,
         tile_size: int,
@@ -754,13 +958,15 @@ class Save:
         match_point_3: object,
         coverage_ratio: float,
         min_patch_size: int,
+        model_workers: int | None = None,
+        model_memory_fraction: float = 0.55,
         **kwargs,
     ) -> None:
         self.x_load_path = x_load_path
         self.y_load_path = y_load_path
         self.model_load_fold = model_load_fold
         self.save_fold = save_fold
-        self.downsample_factor = int(downsample_factor)
+        self.downsample_factor = downsample_factor
         self.chunk_size = int(chunk_size)
         self.seam_width = int(seam_width)
         self.tile_size = int(tile_size)
@@ -769,6 +975,10 @@ class Save:
         self.match_point_3 = match_point_3
         self.coverage_ratio = float(coverage_ratio)
         self.min_patch_size = int(min_patch_size)
+        self.model_workers = (
+            None if model_workers is None else int(model_workers)
+        )
+        self.model_memory_fraction = float(model_memory_fraction)
 
     def forward(self) -> None:
         run(
@@ -785,4 +995,6 @@ class Save:
             match_point_3=self.match_point_3,
             coverage_ratio=self.coverage_ratio,
             min_patch_size=self.min_patch_size,
+            model_workers=self.model_workers,
+            model_memory_fraction=self.model_memory_fraction,
         )
