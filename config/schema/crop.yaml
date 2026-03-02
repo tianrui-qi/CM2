@@ -4,6 +4,9 @@ crop:
   y_save_fold: null   # default: y_load_path without suffix
   frame: [0, -1]
   chunk_size: 32
+  # true: stitched seam-aware patching; 
+  # false: regular tile grid patching
+  after_stitch: true
   # seam
   seam_width: 4
   tile_size: 500

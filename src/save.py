@@ -15,6 +15,7 @@ import zarr
 from .crop import (
     add_midpoint_stitch_seams,
     build_patch_boundary_mask,
+    build_patch_specs_regular_grid,
     build_patch_specs_for_stitched,
     build_quadrant_masks,
     overlay_quadrant_grid,
@@ -101,6 +102,25 @@ def _resolve_patch_folders(
             f"model_load_fold must be an existing directory: {model_load_fold}"
         )
     return y_load_fold, model_load_fold
+
+
+def _infer_after_stitch_from_models(
+    y_load_path: Path,
+    model_load_fold_cfg: str | None,
+) -> bool:
+    _, model_load_fold = _resolve_patch_folders(y_load_path, model_load_fold_cfg)
+    model_files = sorted(model_load_fold.glob("*.hdf5"), key=lambda p: p.name)
+    if not model_files:
+        raise FileNotFoundError(f"No .hdf5 model files found in: {model_load_fold}")
+
+    # Stitched crop generates quadrant ids (qrow/qcol) across multiple quadrants.
+    # Regular grid crop stores all patches as 0-0-<row>-<col>.
+    for model_path in model_files:
+        patch_name = _model_file_to_patch_name(model_path)
+        qrow, qcol, _, _ = _parse_patch_name(patch_name)
+        if qrow != 0 or qcol != 0:
+            return True
+    return False
 
 
 def _collect_patch_meta(
@@ -839,79 +859,114 @@ def run(
     save_path_first_frame_x = plot_dir / f"{x_base}-f0.tif"
     save_path_first_frame_y = plot_dir / f"{y_base}-f0.tif"
 
-    first_frame = read_first_frame(input_path)
+    first_frame_x = read_first_frame(input_path)
     first_frame_y = read_first_frame(y_input_path)
-    h, w = first_frame.shape
 
     plot_dir.mkdir(parents=True, exist_ok=True)
-    mp1 = parse_match_point(match_point_1, "match_point_1")
-    mp2 = parse_match_point(match_point_2, "match_point_2")
-    mp3 = parse_match_point(match_point_3, "match_point_3")
-    seam_width = int(seam_width)
-    if seam_width < 2 or seam_width % 2 != 0:
-        raise ValueError(
-            f"seam_width must be an even integer >= 2, got {seam_width}"
-        )
+    after_stitch = _infer_after_stitch_from_models(
+        y_load_path=y_input_path,
+        model_load_fold_cfg=model_load_fold,
+    )
     tile_size = int(tile_size)
+    if tile_size <= 0:
+        raise ValueError(f"tile_size must be > 0, got {tile_size}")
 
-    masks = build_quadrant_masks(
-        height=h,
-        width=w,
-        tile_size=tile_size,
-        seam_width=seam_width,
-    )
-    overlay_rgb = overlay_quadrant_grid(first_frame, masks)
-    save_image(save_path_1, overlay_rgb)
-    stitched_rgb = stitch_image(
-        image=overlay_rgb,
-        match_point_1=mp1,
-        match_point_2=mp2,
-        match_point_3=mp3,
-    )
-    stitched_rgb = add_midpoint_stitch_seams(
-        stitched=stitched_rgb,
-        input_shape=(h, w),
-        match_point_1=mp1,
-        match_point_2=mp2,
-        match_point_3=mp3,
-        seam_width=seam_width,
-    )
-    save_image(save_path_2, stitched_rgb)
-    stitched_frame = stitch_image(
-        image=first_frame,
-        match_point_1=mp1,
-        match_point_2=mp2,
-        match_point_3=mp3,
-    )
-    stitched_shape = (int(stitched_frame.shape[0]), int(stitched_frame.shape[1]))
+    if after_stitch:
+        h, w = first_frame_x.shape
+        mp1 = parse_match_point(match_point_1, "match_point_1")
+        mp2 = parse_match_point(match_point_2, "match_point_2")
+        mp3 = parse_match_point(match_point_3, "match_point_3")
+        seam_width = int(seam_width)
+        if seam_width < 2 or seam_width % 2 != 0:
+            raise ValueError(
+                f"seam_width must be an even integer >= 2, got {seam_width}"
+            )
 
-    patch_specs = build_patch_specs_for_stitched(
-        stitched_shape=stitched_shape,
-        pre_stitch_shape=(h, w),
-        tile_size=tile_size,
-        seam_width=seam_width,
-        match_point_1=mp1,
-        match_point_2=mp2,
-        match_point_3=mp3,
-        coverage_ratio=float(coverage_ratio),
-        min_patch_size=int(min_patch_size),
-    )
-    core_specs = {
-        spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
-        for spec in patch_specs
-    }
-    crop_mask = build_patch_boundary_mask(
-        stitched_shape=stitched_shape,
-        patch_specs=patch_specs,
-        seam_width=seam_width,
-    )
-    crop_overlay = overlay_white_lines(stitched_frame, crop_mask)
-    save_image(save_path_3, crop_overlay)
+        masks = build_quadrant_masks(
+            height=h,
+            width=w,
+            tile_size=tile_size,
+            seam_width=seam_width,
+        )
+        overlay_rgb = overlay_quadrant_grid(first_frame_x, masks)
+        save_image(save_path_1, overlay_rgb)
+        stitched_rgb = stitch_image(
+            image=overlay_rgb,
+            match_point_1=mp1,
+            match_point_2=mp2,
+            match_point_3=mp3,
+        )
+        stitched_rgb = add_midpoint_stitch_seams(
+            stitched=stitched_rgb,
+            input_shape=(h, w),
+            match_point_1=mp1,
+            match_point_2=mp2,
+            match_point_3=mp3,
+            seam_width=seam_width,
+        )
+        save_image(save_path_2, stitched_rgb)
+        stitched_frame = stitch_image(
+            image=first_frame_x,
+            match_point_1=mp1,
+            match_point_2=mp2,
+            match_point_3=mp3,
+        )
+        stitched_shape = (int(stitched_frame.shape[0]), int(stitched_frame.shape[1]))
 
-    seam_only = np.zeros((stitched_shape[0], stitched_shape[1], 3), dtype=np.uint8)
-    seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
-    save_image(save_path_4, seam_only)
-    tifffile.imwrite(save_path_first_frame_x, first_frame)
+        patch_specs = build_patch_specs_for_stitched(
+            stitched_shape=stitched_shape,
+            pre_stitch_shape=(h, w),
+            tile_size=tile_size,
+            seam_width=seam_width,
+            match_point_1=mp1,
+            match_point_2=mp2,
+            match_point_3=mp3,
+            coverage_ratio=float(coverage_ratio),
+            min_patch_size=int(min_patch_size),
+        )
+        core_specs = {
+            spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
+            for spec in patch_specs
+        }
+        crop_mask = build_patch_boundary_mask(
+            stitched_shape=stitched_shape,
+            patch_specs=patch_specs,
+            seam_width=seam_width,
+        )
+        crop_overlay = overlay_white_lines(stitched_frame, crop_mask)
+        save_image(save_path_3, crop_overlay)
+        seam_only = np.zeros((stitched_shape[0], stitched_shape[1], 3), dtype=np.uint8)
+        seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
+        save_image(save_path_4, seam_only)
+    else:
+        seam_width = int(seam_width)
+        y_h, y_w = first_frame_y.shape
+        patch_specs = build_patch_specs_regular_grid(
+            image_shape=(y_h, y_w),
+            tile_size=tile_size,
+        )
+        if not patch_specs:
+            raise ValueError(f"No valid patches for input shape {(y_h, y_w)}")
+        core_specs = {
+            spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
+            for spec in patch_specs
+        }
+
+        vis_seam_width = max(2, seam_width)
+        crop_mask = build_patch_boundary_mask(
+            stitched_shape=(y_h, y_w),
+            patch_specs=patch_specs,
+            seam_width=vis_seam_width,
+        )
+        crop_overlay = overlay_white_lines(first_frame_y, crop_mask)
+        seam_only = np.zeros((y_h, y_w, 3), dtype=np.uint8)
+        seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
+        save_image(save_path_1, crop_overlay)
+        save_image(save_path_2, seam_only)
+        save_image(save_path_3, crop_overlay)
+        save_image(save_path_4, seam_only)
+
+    tifffile.imwrite(save_path_first_frame_x, first_frame_x)
     tifffile.imwrite(save_path_first_frame_y, first_frame_y)
     for factor in downsample_factors:
         if factor > 1:

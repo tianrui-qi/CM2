@@ -634,6 +634,38 @@ def build_patch_specs_for_stitched(
     return patch_specs
 
 
+def build_patch_specs_regular_grid(
+    image_shape: tuple[int, int],
+    tile_size: int,
+) -> list[PatchSpec]:
+    out_h, out_w = image_shape
+    if out_h <= 0 or out_w <= 0:
+        return []
+
+    patch_specs: list[PatchSpec] = []
+    patch_row = 0
+    for y0 in range(0, out_h, tile_size):
+        y1 = min(y0 + tile_size, out_h)
+        patch_col = 0
+        for x0 in range(0, out_w, tile_size):
+            x1 = min(x0 + tile_size, out_w)
+            patch_specs.append(
+                PatchSpec(
+                    quadrant_row=0,
+                    quadrant_col=0,
+                    patch_row=patch_row,
+                    patch_col=patch_col,
+                    y0=y0,
+                    y1=y1,
+                    x0=x0,
+                    x1=x1,
+                )
+            )
+            patch_col += 1
+        patch_row += 1
+    return patch_specs
+
+
 def build_patch_boundary_mask(
     stitched_shape: tuple[int, int],
     patch_specs: list[PatchSpec],
@@ -768,6 +800,7 @@ def run(
     y_save_fold: str | None,
     frame: Sequence[int],
     chunk_size: int,
+    after_stitch: bool,
     seam_width: int,
     tile_size: int,
     match_point_1: object,
@@ -777,23 +810,14 @@ def run(
     min_patch_size: int,
     pad: int,
 ) -> None:
-    input_path = Path(x_load_path)
     if y_load_path is None:
         raise ValueError("y_load_path must be set.")
     patch_input = Path(y_load_path)
 
-    first_frame = read_first_frame(input_path)
-    h, w = first_frame.shape
-
-    mp1 = parse_match_point(match_point_1, "match_point_1")
-    mp2 = parse_match_point(match_point_2, "match_point_2")
-    mp3 = parse_match_point(match_point_3, "match_point_3")
-    seam_width = int(seam_width)
-    if seam_width < 2 or seam_width % 2 != 0:
-        raise ValueError(
-            f"seam_width must be an even integer >= 2, got {seam_width}"
-        )
+    after_stitch = bool(after_stitch)
     tile_size = int(tile_size)
+    if tile_size <= 0:
+        raise ValueError(f"tile_size must be > 0, got {tile_size}")
 
     with tifffile.TiffFile(patch_input) as tif:
         video = zarr.open(tif.aszarr(), mode="r")
@@ -806,17 +830,38 @@ def run(
                 f"Unsupported stitched TIFF ndim={video.ndim}: {patch_input}"
             )
 
-    patch_specs = build_patch_specs_for_stitched(
-        stitched_shape=stitched_shape,
-        pre_stitch_shape=(h, w),
-        tile_size=tile_size,
-        seam_width=seam_width,
-        match_point_1=mp1,
-        match_point_2=mp2,
-        match_point_3=mp3,
-        coverage_ratio=float(coverage_ratio),
-        min_patch_size=int(min_patch_size),
-    )
+    if after_stitch:
+        input_path = Path(x_load_path)
+        first_frame = read_first_frame(input_path)
+        h, w = first_frame.shape
+
+        mp1 = parse_match_point(match_point_1, "match_point_1")
+        mp2 = parse_match_point(match_point_2, "match_point_2")
+        mp3 = parse_match_point(match_point_3, "match_point_3")
+        seam_width = int(seam_width)
+        if seam_width < 2 or seam_width % 2 != 0:
+            raise ValueError(
+                f"seam_width must be an even integer >= 2, got {seam_width}"
+            )
+
+        patch_specs = build_patch_specs_for_stitched(
+            stitched_shape=stitched_shape,
+            pre_stitch_shape=(h, w),
+            tile_size=tile_size,
+            seam_width=seam_width,
+            match_point_1=mp1,
+            match_point_2=mp2,
+            match_point_3=mp3,
+            coverage_ratio=float(coverage_ratio),
+            min_patch_size=int(min_patch_size),
+        )
+    else:
+        patch_specs = build_patch_specs_regular_grid(
+            image_shape=stitched_shape,
+            tile_size=tile_size,
+        )
+        if not patch_specs:
+            raise ValueError(f"No valid patches for input shape {stitched_shape}")
 
     output_dir = (
         Path(y_save_fold)
@@ -850,6 +895,7 @@ class Crop:
         y_save_fold: str | None,
         frame: Sequence[int],
         chunk_size: int,
+        after_stitch: bool,
         seam_width: int,
         tile_size: int,
         match_point_1: object,
@@ -865,6 +911,7 @@ class Crop:
         self.y_save_fold = y_save_fold
         self.frame = list(frame)
         self.chunk_size = int(chunk_size)
+        self.after_stitch = bool(after_stitch)
         self.seam_width = int(seam_width)
         self.tile_size = int(tile_size)
         self.match_point_1 = match_point_1
@@ -881,6 +928,7 @@ class Crop:
             y_save_fold=self.y_save_fold,
             frame=self.frame,
             chunk_size=self.chunk_size,
+            after_stitch=self.after_stitch,
             seam_width=self.seam_width,
             tile_size=self.tile_size,
             match_point_1=self.match_point_1,
