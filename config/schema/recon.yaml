@@ -29,10 +29,3 @@ recon:
     edge_protection: 40
     overlap: 40
     brightness_matching: false
-  # stitching
-  stitch:
-    enable: true
-    match_point_1: [[1884, 895], [292, 891]]
-    match_point_2: [[1623, 895], [91, 908]]
-    match_point_3: [[1264, 1277], [1234, 72]]
-    match_brightness: false

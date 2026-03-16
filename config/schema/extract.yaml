@@ -1,6 +1,6 @@
 extract:
-  y_load_fold: ???        # tif path or folder containing tif patches
-  model_save_fold: null   # default: [parent of y_load_fold]/model
+  y_load_fold: ???  # tif path or folder containing tif patches
+  model_save_fold: ???
   data:
     fr: 10
     decay_time: 1.5

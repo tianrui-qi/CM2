@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 from collections.abc import Sequence
+import json
 import numpy as np
 from pathlib import Path
 import tifffile
 import tqdm
 import zarr
 
-from .recon.stitch import Stitch
+from .stitch import MatchPointStitch, stitch_frame_from_offsets
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,23 @@ def build_quadrant_masks(
     return masks
 
 
+def build_quadrant_support_masks(height: int, width: int) -> list[np.ndarray]:
+    y_mid = height // 2
+    x_mid = width // 2
+    quads = [
+        (0, y_mid, 0, x_mid),
+        (0, y_mid, x_mid, width),
+        (y_mid, height, 0, x_mid),
+        (y_mid, height, x_mid, width),
+    ]
+    masks: list[np.ndarray] = []
+    for y0, y1, x0, x1 in quads:
+        mask = np.zeros((height, width), dtype=np.float32)
+        mask[y0:y1, x0:x1] = 1.0
+        masks.append(mask)
+    return masks
+
+
 def read_first_frame(path: Path) -> np.ndarray:
     data = tifffile.memmap(path)
     if data.ndim == 2:
@@ -189,7 +207,7 @@ def stitch_image(
     match_point_2: tuple[tuple[int, int], tuple[int, int]],
     match_point_3: tuple[tuple[int, int], tuple[int, int]],
 ) -> np.ndarray:
-    stitch = Stitch(
+    stitch = MatchPointStitch(
         match_point_1=match_point_1,
         match_point_2=match_point_2,
         match_point_3=match_point_3,
@@ -431,6 +449,203 @@ def center_to_cut(center: float, limit: int) -> int:
     return max(1, min(limit - 1, cut))
 
 
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_crop_stitch_params(
+    para_load_path: Path,
+    *,
+    pre_stitch_shape: tuple[int, int] | None = None,
+) -> dict[str, object]:
+    para_load_path = Path(para_load_path)
+    root_dir = para_load_path if para_load_path.is_dir() else para_load_path.parent
+
+    if para_load_path.is_dir():
+        root_candidates = [para_load_path / "para.json", para_load_path / "crop_stitch_params.json"]
+    else:
+        root_candidates = [para_load_path]
+        if para_load_path.name == "para.json":
+            root_candidates.append(para_load_path.with_name("crop_stitch_params.json"))
+        elif para_load_path.name == "crop_stitch_params.json":
+            root_candidates.append(para_load_path.with_name("para.json"))
+
+    for crop_params_path in root_candidates:
+        if not crop_params_path.exists():
+            continue
+        payload = _load_json(crop_params_path)
+        if pre_stitch_shape is not None and "pre_stitch_shape" not in payload:
+            payload["pre_stitch_shape"] = [int(pre_stitch_shape[0]), int(pre_stitch_shape[1])]
+        return payload
+
+    final_dir = root_dir / "LR"
+    if not final_dir.exists():
+        alt_final_dir = root_dir / "RL"
+        if alt_final_dir.exists():
+            final_dir = alt_final_dir
+
+    left_json = root_dir / "L" / "selection.json"
+    right_json = root_dir / "R" / "selection.json"
+    final_json = final_dir / "selection.json"
+    if not (left_json.exists() and right_json.exists() and final_json.exists()):
+        raise FileNotFoundError(
+            "Could not find para.json via para_load_path, and no legacy crop_stitch_params.json/selection.json files were available."
+        )
+
+    left_payload = _load_json(left_json)
+    right_payload = _load_json(right_json)
+    final_payload = _load_json(final_json)
+    payload: dict[str, object] = {
+        "version": 1,
+        "order": "vertical_then_horizontal",
+        "left": {
+            "offset_y": float(left_payload["offset_y"]),
+            "offset_x": float(left_payload["offset_x"]),
+            "selection_json": str(left_json),
+        },
+        "right": {
+            "offset_y": float(right_payload["offset_y"]),
+            "offset_x": float(right_payload["offset_x"]),
+            "selection_json": str(right_json),
+        },
+        "final": {
+            "offset_y": float(final_payload["offset_y"]),
+            "offset_x": float(final_payload["offset_x"]),
+            "selection_json": str(final_json),
+        },
+    }
+    if pre_stitch_shape is not None:
+        payload["pre_stitch_shape"] = [int(pre_stitch_shape[0]), int(pre_stitch_shape[1])]
+    return payload
+
+
+def _parse_crop_bounds(raw: object) -> tuple[int, int, int, int] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
+        raise ValueError(f"crop_bounds must be a 4-item sequence, got {type(raw).__name__}")
+    values = [int(v) for v in raw]
+    if len(values) != 4:
+        raise ValueError(f"crop_bounds must contain 4 integers, got {values}")
+    y0, y1, x0, x1 = values
+    if y1 <= y0 or x1 <= x0:
+        raise ValueError(f"Invalid crop_bounds: {values}")
+    return y0, y1, x0, x1
+
+
+def _extract_stage_crop_bounds(
+    stitch_params: dict[str, object],
+    stage_name: str,
+) -> tuple[int, int, int, int] | None:
+    stage = stitch_params.get(stage_name)
+    if isinstance(stage, dict):
+        crop_bounds = _parse_crop_bounds(stage.get("crop_bounds"))
+        if crop_bounds is not None:
+            return crop_bounds
+    if stage_name == "final":
+        return _parse_crop_bounds(stitch_params.get("crop_bounds"))
+    return None
+
+
+def save_crop_params(
+    para_save_path: Path,
+    *,
+    patch_specs: list[PatchSpec],
+    after_stitch: bool,
+    pad: int,
+) -> None:
+    payload = {
+        "version": 1,
+        "after_stitch": bool(after_stitch),
+        "pad": int(pad),
+        "patch_specs": [
+            {
+                "name": spec.name,
+                "quadrant_row": int(spec.quadrant_row),
+                "quadrant_col": int(spec.quadrant_col),
+                "patch_row": int(spec.patch_row),
+                "patch_col": int(spec.patch_col),
+                "y0": int(spec.y0),
+                "y1": int(spec.y1),
+                "x0": int(spec.x0),
+                "x1": int(spec.x1),
+            }
+            for spec in patch_specs
+        ],
+    }
+    para_save_path.parent.mkdir(parents=True, exist_ok=True)
+    para_save_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True),
+        encoding="utf-8",
+    )
+
+
+def load_crop_params(para_load_path: Path) -> dict[str, object]:
+    para_load_path = Path(para_load_path)
+    if para_load_path.is_dir():
+        para_path = para_load_path / "para.json"
+    else:
+        para_path = para_load_path
+    if not para_path.exists():
+        raise FileNotFoundError(f"Crop para.json not found: {para_path}")
+    payload = _load_json(para_path)
+    patch_specs_raw = payload.get("patch_specs")
+    if not isinstance(patch_specs_raw, list) or not patch_specs_raw:
+        raise ValueError(f"Invalid crop para.json patch_specs: {para_path}")
+    patch_specs = [
+        PatchSpec(
+            quadrant_row=int(spec["quadrant_row"]),
+            quadrant_col=int(spec["quadrant_col"]),
+            patch_row=int(spec["patch_row"]),
+            patch_col=int(spec["patch_col"]),
+            y0=int(spec["y0"]),
+            y1=int(spec["y1"]),
+            x0=int(spec["x0"]),
+            x1=int(spec["x1"]),
+        )
+        for spec in patch_specs_raw
+    ]
+    payload["patch_specs"] = patch_specs
+    return payload
+
+
+def _center_cut_from_overlap_masks(
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    *,
+    axis: str,
+    limit: int,
+) -> int:
+    overlap = np.asarray(mask_a, dtype=bool) & np.asarray(mask_b, dtype=bool)
+    if axis == "vertical":
+        proj_overlap = np.any(overlap, axis=0)
+        runs = find_true_runs(proj_overlap)
+        if runs:
+            start, end = max(runs, key=lambda r: r[1] - r[0])
+            return center_to_cut((start + end) / 2.0, limit)
+        proj_a = np.any(mask_a, axis=0)
+        proj_b = np.any(mask_b, axis=0)
+        a_idx = np.flatnonzero(proj_a)
+        b_idx = np.flatnonzero(proj_b)
+        if a_idx.size == 0 or b_idx.size == 0:
+            raise ValueError("Could not infer vertical seam cut from empty support masks.")
+        return center_to_cut((float(a_idx[-1]) + float(b_idx[0])) / 2.0, limit)
+    if axis == "horizontal":
+        proj_overlap = np.any(overlap, axis=1)
+        runs = find_true_runs(proj_overlap)
+        if runs:
+            start, end = max(runs, key=lambda r: r[1] - r[0])
+            return center_to_cut((start + end) / 2.0, limit)
+        proj_a = np.any(mask_a, axis=1)
+        proj_b = np.any(mask_b, axis=1)
+        a_idx = np.flatnonzero(proj_a)
+        b_idx = np.flatnonzero(proj_b)
+        if a_idx.size == 0 or b_idx.size == 0:
+            raise ValueError("Could not infer horizontal seam cut from empty support masks.")
+        return center_to_cut((float(a_idx[-1]) + float(b_idx[0])) / 2.0, limit)
+    raise ValueError("axis must be 'vertical' or 'horizontal'.")
+
+
 def runs_to_cut_positions(
     runs: list[tuple[int, int]],
     length: int,
@@ -634,6 +849,139 @@ def build_patch_specs_for_stitched(
     return patch_specs
 
 
+def build_patch_specs_for_stitched_from_offsets(
+    stitched_shape: tuple[int, int],
+    pre_stitch_shape: tuple[int, int],
+    tile_size: int,
+    seam_width: int,
+    left_offset_y: float,
+    left_offset_x: float,
+    right_offset_y: float,
+    right_offset_x: float,
+    final_offset_y: float,
+    final_offset_x: float,
+    coverage_ratio: float,
+    min_patch_size: int,
+    left_crop_bounds: tuple[int, int, int, int] | None = None,
+    right_crop_bounds: tuple[int, int, int, int] | None = None,
+    final_crop_bounds: tuple[int, int, int, int] | None = None,
+) -> list[PatchSpec]:
+    out_h, out_w = stitched_shape
+    support_masks = [
+        stitch_frame_from_offsets(
+            mask,
+            left_offset_y=left_offset_y,
+            left_offset_x=left_offset_x,
+            right_offset_y=right_offset_y,
+            right_offset_x=right_offset_x,
+            final_offset_y=final_offset_y,
+            final_offset_x=final_offset_x,
+            left_crop_bounds=left_crop_bounds,
+            right_crop_bounds=right_crop_bounds,
+            final_crop_bounds=final_crop_bounds,
+        )
+        > 1e-6
+        for mask in build_quadrant_support_masks(pre_stitch_shape[0], pre_stitch_shape[1])
+    ]
+    seam_masks = [
+        stitch_frame_from_offsets(
+            mask.astype(np.float32),
+            left_offset_y=left_offset_y,
+            left_offset_x=left_offset_x,
+            right_offset_y=right_offset_y,
+            right_offset_x=right_offset_x,
+            final_offset_y=final_offset_y,
+            final_offset_x=final_offset_x,
+            left_crop_bounds=left_crop_bounds,
+            right_crop_bounds=right_crop_bounds,
+            final_crop_bounds=final_crop_bounds,
+        )
+        > 1e-6
+        for mask in build_quadrant_masks(
+            pre_stitch_shape[0],
+            pre_stitch_shape[1],
+            tile_size,
+            seam_width,
+        )
+    ]
+    for mask in [*support_masks, *seam_masks]:
+        if mask.shape != (out_h, out_w):
+            raise ValueError(
+                f"Stitched mask shape mismatch: got {mask.shape}, expected {(out_h, out_w)}"
+            )
+
+    left_support = support_masks[0] | support_masks[2]
+    right_support = support_masks[1] | support_masks[3]
+    x_cut = _center_cut_from_overlap_masks(left_support, right_support, axis="vertical", limit=out_w)
+    y_cut_left = _center_cut_from_overlap_masks(support_masks[0], support_masks[2], axis="horizontal", limit=out_h)
+    y_cut_right = _center_cut_from_overlap_masks(support_masks[1], support_masks[3], axis="horizontal", limit=out_h)
+
+    regions: dict[tuple[int, int], tuple[int, int, int, int]] = {
+        (0, 0): (0, y_cut_left, 0, x_cut),
+        (0, 1): (0, y_cut_right, x_cut, out_w),
+        (1, 0): (y_cut_left, out_h, 0, x_cut),
+        (1, 1): (y_cut_right, out_h, x_cut, out_w),
+    }
+
+    edge_width = seam_width // 2
+    patch_specs: list[PatchSpec] = []
+    quadrant_order = [
+        ((0, 0), 0),
+        ((0, 1), 1),
+        ((1, 0), 2),
+        ((1, 1), 3),
+    ]
+    for (q_row, q_col), q_idx in quadrant_order:
+        ry0, ry1, rx0, rx1 = regions[(q_row, q_col)]
+        if ry1 <= ry0 or rx1 <= rx0:
+            raise ValueError(
+                f"Invalid quadrant region for {(q_row, q_col)}: y=({ry0},{ry1}) x=({rx0},{rx1})"
+            )
+        region_mask = seam_masks[q_idx][ry0:ry1, rx0:rx1]
+        hq, wq = region_mask.shape
+
+        row_runs = detect_axis_seam_runs(region_mask, "horizontal", coverage_ratio)
+        col_runs = detect_axis_seam_runs(region_mask, "vertical", coverage_ratio)
+        row_runs = merge_runs(row_runs, hq)
+        col_runs = merge_runs(col_runs, wq)
+
+        row_cuts = runs_to_cut_positions(row_runs, hq, edge_margin=max(1, edge_width * 2))
+        col_cuts = runs_to_cut_positions(col_runs, wq, edge_margin=max(1, edge_width * 2))
+
+        row_spans = spans_from_cuts(hq, row_cuts, min_patch_size)
+        col_spans = spans_from_cuts(wq, col_cuts, min_patch_size)
+        if not row_spans or not col_spans:
+            raise ValueError(
+                f"No valid patch spans in quadrant {(q_row, q_col)}. row_spans={row_spans}, col_spans={col_spans}"
+            )
+
+        for p_row, (py0, py1) in enumerate(row_spans):
+            for p_col, (px0, px1) in enumerate(col_spans):
+                patch_specs.append(
+                    PatchSpec(
+                        quadrant_row=q_row,
+                        quadrant_col=q_col,
+                        patch_row=p_row,
+                        patch_col=p_col,
+                        y0=ry0 + py0,
+                        y1=ry0 + py1,
+                        x0=rx0 + px0,
+                        x1=rx0 + px1,
+                    )
+                )
+
+    coverage = np.zeros((out_h, out_w), dtype=np.uint8)
+    for spec in patch_specs:
+        coverage[spec.y0 : spec.y1, spec.x0 : spec.x1] += 1
+    min_cov = int(coverage.min())
+    max_cov = int(coverage.max())
+    if min_cov != 1 or max_cov != 1:
+        raise ValueError(
+            f"Patch specs must cover stitched image exactly once, got coverage min={min_cov}, max={max_cov}"
+        )
+    return patch_specs
+
+
 def build_patch_specs_regular_grid(
     image_shape: tuple[int, int],
     tile_size: int,
@@ -794,21 +1142,182 @@ def save_image(path: Path, image: np.ndarray) -> None:
     )
 
 
+def stitch_image_from_offsets(
+    image: np.ndarray,
+    *,
+    left_offset_y: float,
+    left_offset_x: float,
+    right_offset_y: float,
+    right_offset_x: float,
+    final_offset_y: float,
+    final_offset_x: float,
+    left_crop_bounds: tuple[int, int, int, int] | None = None,
+    right_crop_bounds: tuple[int, int, int, int] | None = None,
+    final_crop_bounds: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
+    if image.ndim == 2:
+        return stitch_frame_from_offsets(
+            image.astype(np.float32, copy=False),
+            left_offset_y=left_offset_y,
+            left_offset_x=left_offset_x,
+            right_offset_y=right_offset_y,
+            right_offset_x=right_offset_x,
+            final_offset_y=final_offset_y,
+            final_offset_x=final_offset_x,
+            left_crop_bounds=left_crop_bounds,
+            right_crop_bounds=right_crop_bounds,
+            final_crop_bounds=final_crop_bounds,
+        )
+
+    if image.ndim == 3 and image.shape[2] == 3:
+        channels: list[np.ndarray] = []
+        for c in range(3):
+            stitched_c = stitch_frame_from_offsets(
+                image[..., c].astype(np.float32, copy=False),
+                left_offset_y=left_offset_y,
+                left_offset_x=left_offset_x,
+                right_offset_y=right_offset_y,
+                right_offset_x=right_offset_x,
+                final_offset_y=final_offset_y,
+                final_offset_x=final_offset_x,
+                left_crop_bounds=left_crop_bounds,
+                right_crop_bounds=right_crop_bounds,
+                final_crop_bounds=final_crop_bounds,
+            )
+            channels.append(stitched_c)
+        stitched_rgb = np.stack(channels, axis=-1)
+        return np.clip(stitched_rgb, 0, 255).astype(np.uint8)
+
+    raise ValueError(f"Unsupported image shape for offset stitching: {image.shape}")
+
+
+def save_crop_visualizations(
+    *,
+    x_load_path: Path,
+    y_load_path: Path,
+    result_save_fold: Path,
+    patch_specs: list[PatchSpec],
+    seam_width: int,
+    tile_size: int,
+    after_stitch: bool,
+    stitch_params: dict[str, object] | None = None,
+    match_point_1: tuple[tuple[int, int], tuple[int, int]] | None = None,
+    match_point_2: tuple[tuple[int, int], tuple[int, int]] | None = None,
+    match_point_3: tuple[tuple[int, int], tuple[int, int]] | None = None,
+) -> None:
+    result_save_fold.mkdir(parents=True, exist_ok=True)
+    save_path_1 = result_save_fold / "crop-1.tif"
+    save_path_2 = result_save_fold / "crop-2.tif"
+    save_path_3 = result_save_fold / "crop-3.tif"
+    save_path_4 = result_save_fold / "crop-4.tif"
+
+    first_frame_y = read_first_frame(y_load_path)
+
+    if after_stitch:
+        first_frame_x = read_first_frame(x_load_path)
+        h, w = first_frame_x.shape
+        masks = build_quadrant_masks(
+            height=h,
+            width=w,
+            tile_size=tile_size,
+            seam_width=seam_width,
+        )
+        overlay_rgb = overlay_quadrant_grid(first_frame_x, masks)
+        save_image(save_path_1, overlay_rgb)
+
+        if stitch_params is not None:
+            left = stitch_params["left"]
+            right = stitch_params["right"]
+            final = stitch_params["final"]
+            left_crop_bounds = _extract_stage_crop_bounds(stitch_params, "left")
+            right_crop_bounds = _extract_stage_crop_bounds(stitch_params, "right")
+            final_crop_bounds = _extract_stage_crop_bounds(stitch_params, "final")
+            stitched_rgb = stitch_image_from_offsets(
+                overlay_rgb,
+                left_offset_y=float(left["offset_y"]),
+                left_offset_x=float(left["offset_x"]),
+                right_offset_y=float(right["offset_y"]),
+                right_offset_x=float(right["offset_x"]),
+                final_offset_y=float(final["offset_y"]),
+                final_offset_x=float(final["offset_x"]),
+                left_crop_bounds=left_crop_bounds,
+                right_crop_bounds=right_crop_bounds,
+                final_crop_bounds=final_crop_bounds,
+            )
+        else:
+            if (
+                match_point_1 is None
+                or match_point_2 is None
+                or match_point_3 is None
+            ):
+                raise ValueError(
+                    "after_stitch crop visualization requires stitch_params or all legacy match points."
+                )
+            stitched_rgb = stitch_image(
+                image=overlay_rgb,
+                match_point_1=match_point_1,
+                match_point_2=match_point_2,
+                match_point_3=match_point_3,
+            )
+            stitched_rgb = add_midpoint_stitch_seams(
+                stitched=stitched_rgb,
+                input_shape=(h, w),
+                match_point_1=match_point_1,
+                match_point_2=match_point_2,
+                match_point_3=match_point_3,
+                seam_width=seam_width,
+            )
+        save_image(save_path_2, stitched_rgb)
+
+        crop_mask = build_patch_boundary_mask(
+            stitched_shape=(int(first_frame_y.shape[0]), int(first_frame_y.shape[1])),
+            patch_specs=patch_specs,
+            seam_width=seam_width,
+        )
+        crop_overlay = overlay_white_lines(first_frame_y, crop_mask)
+        save_image(save_path_3, crop_overlay)
+        seam_only = np.zeros(
+            (int(first_frame_y.shape[0]), int(first_frame_y.shape[1]), 3),
+            dtype=np.uint8,
+        )
+        seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
+        save_image(save_path_4, seam_only)
+        return
+
+    crop_mask = build_patch_boundary_mask(
+        stitched_shape=(int(first_frame_y.shape[0]), int(first_frame_y.shape[1])),
+        patch_specs=patch_specs,
+        seam_width=max(2, int(seam_width)),
+    )
+    crop_overlay = overlay_white_lines(first_frame_y, crop_mask)
+    seam_only = np.zeros(
+        (int(first_frame_y.shape[0]), int(first_frame_y.shape[1]), 3),
+        dtype=np.uint8,
+    )
+    seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
+    save_image(save_path_1, crop_overlay)
+    save_image(save_path_2, seam_only)
+    save_image(save_path_3, crop_overlay)
+    save_image(save_path_4, seam_only)
+
+
 def run(
     x_load_path: str,
     y_load_path: str,
     y_save_fold: str | None,
+    result_save_fold: str | None,
+    para_load_path: str | None,
     frame: Sequence[int],
     chunk_size: int,
     after_stitch: bool,
     seam_width: int,
     tile_size: int,
-    match_point_1: object,
-    match_point_2: object,
-    match_point_3: object,
     coverage_ratio: float,
     min_patch_size: int,
     pad: int,
+    match_point_1: object | None = None,
+    match_point_2: object | None = None,
+    match_point_3: object | None = None,
 ) -> None:
     if y_load_path is None:
         raise ValueError("y_load_path must be set.")
@@ -830,31 +1339,66 @@ def run(
                 f"Unsupported stitched TIFF ndim={video.ndim}: {patch_input}"
             )
 
+    stitch_params: dict[str, object] | None = None
+    mp1: tuple[tuple[int, int], tuple[int, int]] | None = None
+    mp2: tuple[tuple[int, int], tuple[int, int]] | None = None
+    mp3: tuple[tuple[int, int], tuple[int, int]] | None = None
+
     if after_stitch:
         input_path = Path(x_load_path)
         first_frame = read_first_frame(input_path)
         h, w = first_frame.shape
-
-        mp1 = parse_match_point(match_point_1, "match_point_1")
-        mp2 = parse_match_point(match_point_2, "match_point_2")
-        mp3 = parse_match_point(match_point_3, "match_point_3")
         seam_width = int(seam_width)
         if seam_width < 2 or seam_width % 2 != 0:
             raise ValueError(
                 f"seam_width must be an even integer >= 2, got {seam_width}"
             )
-
-        patch_specs = build_patch_specs_for_stitched(
-            stitched_shape=stitched_shape,
-            pre_stitch_shape=(h, w),
-            tile_size=tile_size,
-            seam_width=seam_width,
-            match_point_1=mp1,
-            match_point_2=mp2,
-            match_point_3=mp3,
-            coverage_ratio=float(coverage_ratio),
-            min_patch_size=int(min_patch_size),
-        )
+        if para_load_path is not None:
+            stitch_params = load_crop_stitch_params(
+                Path(para_load_path), pre_stitch_shape=(h, w)
+            )
+            left = stitch_params["left"]
+            right = stitch_params["right"]
+            final = stitch_params["final"]
+            left_crop_bounds = _extract_stage_crop_bounds(stitch_params, "left")
+            right_crop_bounds = _extract_stage_crop_bounds(stitch_params, "right")
+            final_crop_bounds = _extract_stage_crop_bounds(stitch_params, "final")
+            patch_specs = build_patch_specs_for_stitched_from_offsets(
+                stitched_shape=stitched_shape,
+                pre_stitch_shape=(h, w),
+                tile_size=tile_size,
+                seam_width=seam_width,
+                left_offset_y=float(left["offset_y"]),
+                left_offset_x=float(left["offset_x"]),
+                right_offset_y=float(right["offset_y"]),
+                right_offset_x=float(right["offset_x"]),
+                final_offset_y=float(final["offset_y"]),
+                final_offset_x=float(final["offset_x"]),
+                coverage_ratio=float(coverage_ratio),
+                min_patch_size=int(min_patch_size),
+                left_crop_bounds=left_crop_bounds,
+                right_crop_bounds=right_crop_bounds,
+                final_crop_bounds=final_crop_bounds,
+            )
+        else:
+            if match_point_1 is None or match_point_2 is None or match_point_3 is None:
+                raise ValueError(
+                    "after_stitch=True requires either para_load_path or all of match_point_1/match_point_2/match_point_3."
+                )
+            mp1 = parse_match_point(match_point_1, "match_point_1")
+            mp2 = parse_match_point(match_point_2, "match_point_2")
+            mp3 = parse_match_point(match_point_3, "match_point_3")
+            patch_specs = build_patch_specs_for_stitched(
+                stitched_shape=stitched_shape,
+                pre_stitch_shape=(h, w),
+                tile_size=tile_size,
+                seam_width=seam_width,
+                match_point_1=mp1,
+                match_point_2=mp2,
+                match_point_3=mp3,
+                coverage_ratio=float(coverage_ratio),
+                min_patch_size=int(min_patch_size),
+            )
     else:
         patch_specs = build_patch_specs_regular_grid(
             image_shape=stitched_shape,
@@ -869,6 +1413,30 @@ def run(
         else patch_input.with_suffix("")
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir = (
+        Path(result_save_fold)
+        if result_save_fold is not None
+        else patch_input.parent / "crop"
+    )
+    save_crop_params(
+        plot_dir / "para.json",
+        patch_specs=patch_specs,
+        after_stitch=after_stitch,
+        pad=int(pad),
+    )
+    save_crop_visualizations(
+        x_load_path=Path(x_load_path),
+        y_load_path=patch_input,
+        result_save_fold=plot_dir,
+        patch_specs=patch_specs,
+        seam_width=int(seam_width),
+        tile_size=int(tile_size),
+        after_stitch=after_stitch,
+        stitch_params=stitch_params,
+        match_point_1=mp1,
+        match_point_2=mp2,
+        match_point_3=mp3,
+    )
 
     frame_cfg = frame
     if len(frame_cfg) != 2:
@@ -893,22 +1461,26 @@ class Crop:
         x_load_path: str,
         y_load_path: str,
         y_save_fold: str | None,
+        result_save_fold: str | None,
+        para_load_path: str | None,
         frame: Sequence[int],
         chunk_size: int,
         after_stitch: bool,
         seam_width: int,
         tile_size: int,
-        match_point_1: object,
-        match_point_2: object,
-        match_point_3: object,
         coverage_ratio: float,
         min_patch_size: int,
         pad: int,
+        match_point_1: object | None = None,
+        match_point_2: object | None = None,
+        match_point_3: object | None = None,
         **kwargs,
     ) -> None:
         self.x_load_path = x_load_path
         self.y_load_path = y_load_path
         self.y_save_fold = y_save_fold
+        self.result_save_fold = result_save_fold
+        self.para_load_path = para_load_path
         self.frame = list(frame)
         self.chunk_size = int(chunk_size)
         self.after_stitch = bool(after_stitch)
@@ -926,6 +1498,8 @@ class Crop:
             x_load_path=self.x_load_path,
             y_load_path=self.y_load_path,
             y_save_fold=self.y_save_fold,
+            result_save_fold=self.result_save_fold,
+            para_load_path=self.para_load_path,
             frame=self.frame,
             chunk_size=self.chunk_size,
             after_stitch=self.after_stitch,

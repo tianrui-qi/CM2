@@ -10,7 +10,6 @@ from typing import Any
 
 from .decon import Decon
 from .distort import Distort
-from .stitch import Stitch
 
 
 class ProcBar(tqdm.tqdm):
@@ -55,11 +54,9 @@ def run(
     dtype: str,
     distortion: Mapping[str, Any],
     decon: Mapping[str, Any],
-    stitch: Mapping[str, Any],
 ) -> None:
     distortion_cfg = _to_plain_dict(distortion, "distortion")
     decon_cfg = _to_plain_dict(decon, "decon")
-    stitch_cfg = _to_plain_dict(stitch, "stitch")
 
     stages: list[tuple[str, object]] = []
     if bool(distortion_cfg.get("enable", False)):
@@ -68,9 +65,6 @@ def run(
     if bool(decon_cfg.get("enable", False)):
         decon_stage = Decon(**decon_cfg, dtype=dtype)
         stages.append(("deconvolve", decon_stage.forward))
-    if bool(stitch_cfg.get("enable", False)):
-        stitch_stage = Stitch(**stitch_cfg, dtype=dtype)
-        stages.append(("stitch", stitch_stage.forward))
 
     queue_size = max(1, int(queue_size))
     frame_cfg = list(frame)
@@ -302,7 +296,6 @@ class Recon:
         dtype: str,
         distortion: Mapping[str, Any],
         decon: Mapping[str, Any],
-        stitch: Mapping[str, Any],
         **kwargs,
     ) -> None:
         self.x_load_path = x_load_path
@@ -313,7 +306,6 @@ class Recon:
         self.dtype = str(dtype)
         self.distortion = _to_plain_dict(distortion, "distortion")
         self.decon = _to_plain_dict(decon, "decon")
-        self.stitch = _to_plain_dict(stitch, "stitch")
 
     def forward(self) -> None:
         run(
@@ -325,5 +317,4 @@ class Recon:
             dtype=self.dtype,
             distortion=self.distortion,
             decon=self.decon,
-            stitch=self.stitch,
         )

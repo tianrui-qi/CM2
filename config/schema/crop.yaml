@@ -1,7 +1,9 @@
 crop:
   x_load_path: ???
   y_load_path: ???
-  y_save_fold: null   # default: y_load_path without suffix
+  para_load_path: ???
+  y_save_fold: ???
+  result_save_fold: null  # default: [parent of y_save_path]/crop
   frame: [0, -1]
   chunk_size: 32
   # true: stitched seam-aware patching; 
@@ -10,9 +12,6 @@ crop:
   # seam
   seam_width: 4
   tile_size: 500
-  match_point_1: [[1884, 895], [292, 891]]
-  match_point_2: [[1623, 895], [91, 908]]
-  match_point_3: [[1264, 1277], [1234, 72]]
   # seam filter
   coverage_ratio: 0.5
   min_patch_size: 40

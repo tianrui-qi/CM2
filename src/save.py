@@ -13,17 +13,8 @@ import tifffile
 import zarr
 
 from .crop import (
-    add_midpoint_stitch_seams,
-    build_patch_boundary_mask,
-    build_patch_specs_regular_grid,
-    build_patch_specs_for_stitched,
-    build_quadrant_masks,
-    overlay_quadrant_grid,
-    overlay_white_lines,
-    parse_match_point,
+    load_crop_params,
     read_first_frame,
-    save_image,
-    stitch_image,
 )
 
 
@@ -102,25 +93,6 @@ def _resolve_patch_folders(
             f"model_load_fold must be an existing directory: {model_load_fold}"
         )
     return y_load_fold, model_load_fold
-
-
-def _infer_after_stitch_from_models(
-    y_load_path: Path,
-    model_load_fold_cfg: str | None,
-) -> bool:
-    _, model_load_fold = _resolve_patch_folders(y_load_path, model_load_fold_cfg)
-    model_files = sorted(model_load_fold.glob("*.hdf5"), key=lambda p: p.name)
-    if not model_files:
-        raise FileNotFoundError(f"No .hdf5 model files found in: {model_load_fold}")
-
-    # Stitched crop generates quadrant ids (qrow/qcol) across multiple quadrants.
-    # Regular grid crop stores all patches as 0-0-<row>-<col>.
-    for model_path in model_files:
-        patch_name = _model_file_to_patch_name(model_path)
-        qrow, qcol, _, _ = _parse_patch_name(patch_name)
-        if qrow != 0 or qcol != 0:
-            return True
-    return False
 
 
 def _collect_patch_meta(
@@ -628,12 +600,8 @@ def save_model_products_stitched(
         p.core_ly1 = p.core_ly0 + core_h
         p.core_lx1 = p.core_lx0 + core_w
 
-    if (full_h % factor) != 0 or (full_w % factor) != 0:
-        raise ValueError(
-            f"downsample_factor={factor} must divide stitched H/W exactly, got {(full_h, full_w)}"
-        )
-    full_h_ds = full_h // factor
-    full_w_ds = full_w // factor
+    full_h_ds = (full_h + factor - 1) // factor
+    full_w_ds = (full_w + factor - 1) // factor
 
     for p in patches:
         _prepare_patch_downsample_slices(p, factor)
@@ -759,12 +727,6 @@ def save_downsampled_tif(
     with tifffile.TiffFile(x_path) as tif:
         video = zarr.open(tif.aszarr(), mode="r")
         if video.ndim == 2:
-            h = int(video.shape[0])
-            w = int(video.shape[1])
-            if (h % factor) != 0 or (w % factor) != 0:
-                raise ValueError(
-                    f"downsample_factor={factor} must divide H/W exactly, got {(h, w)}"
-                )
             frame = np.asarray(video)
             frame_ds = frame[::factor, ::factor]
             with tifffile.TiffWriter(out_path, bigtiff=True) as writer:
@@ -779,13 +741,6 @@ def save_downsampled_tif(
             raise ValueError(f"Expected 2D or 3D TIFF, got ndim={video.ndim}: {x_path}")
 
         t = int(video.shape[0])
-        h = int(video.shape[1])
-        w = int(video.shape[2])
-        if (h % factor) != 0 or (w % factor) != 0:
-            raise ValueError(
-                f"downsample_factor={factor} must divide H/W exactly, got {(h, w)}"
-            )
-
         with tifffile.TiffWriter(out_path, bigtiff=True) as writer:
             for start in range(0, t, chunk):
                 end = min(start + chunk, t)
@@ -830,15 +785,9 @@ def run(
     y_load_path: str,
     model_load_fold: str | None,
     save_fold: str | None,
+    para_load_path: str | None,
     downsample_factor: object,
     chunk_size: int,
-    seam_width: int,
-    tile_size: int,
-    match_point_1: object,
-    match_point_2: object,
-    match_point_3: object,
-    coverage_ratio: float,
-    min_patch_size: int,
     model_workers: int | None = None,
     model_memory_fraction: float = 0.55,
 ) -> None:
@@ -852,10 +801,6 @@ def run(
     x_base = input_path.with_suffix("").name
     y_base = y_input_path.with_suffix("").name
     downsample_factors = normalize_downsample_factors(downsample_factor)
-    save_path_1 = plot_dir / "crop-1.tif"
-    save_path_2 = plot_dir / "crop-2.tif"
-    save_path_3 = plot_dir / "crop-3.tif"
-    save_path_4 = plot_dir / "crop-4.tif"
     save_path_first_frame_x = plot_dir / f"{x_base}-f0.tif"
     save_path_first_frame_y = plot_dir / f"{y_base}-f0.tif"
 
@@ -863,108 +808,20 @@ def run(
     first_frame_y = read_first_frame(y_input_path)
 
     plot_dir.mkdir(parents=True, exist_ok=True)
-    after_stitch = _infer_after_stitch_from_models(
-        y_load_path=y_input_path,
-        model_load_fold_cfg=model_load_fold,
+    if para_load_path is None:
+        raise ValueError("save requires para_load_path pointing to crop para.json.")
+    crop_params = load_crop_params(Path(para_load_path))
+    patch_specs = crop_params["patch_specs"]
+    core_specs = {
+        spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
+        for spec in patch_specs
+    }
+    resolved_model_load_fold = (
+        y_input_path.parent / "model"
+        if model_load_fold is None
+        else Path(model_load_fold)
     )
-    tile_size = int(tile_size)
-    if tile_size <= 0:
-        raise ValueError(f"tile_size must be > 0, got {tile_size}")
-
-    if after_stitch:
-        h, w = first_frame_x.shape
-        mp1 = parse_match_point(match_point_1, "match_point_1")
-        mp2 = parse_match_point(match_point_2, "match_point_2")
-        mp3 = parse_match_point(match_point_3, "match_point_3")
-        seam_width = int(seam_width)
-        if seam_width < 2 or seam_width % 2 != 0:
-            raise ValueError(
-                f"seam_width must be an even integer >= 2, got {seam_width}"
-            )
-
-        masks = build_quadrant_masks(
-            height=h,
-            width=w,
-            tile_size=tile_size,
-            seam_width=seam_width,
-        )
-        overlay_rgb = overlay_quadrant_grid(first_frame_x, masks)
-        save_image(save_path_1, overlay_rgb)
-        stitched_rgb = stitch_image(
-            image=overlay_rgb,
-            match_point_1=mp1,
-            match_point_2=mp2,
-            match_point_3=mp3,
-        )
-        stitched_rgb = add_midpoint_stitch_seams(
-            stitched=stitched_rgb,
-            input_shape=(h, w),
-            match_point_1=mp1,
-            match_point_2=mp2,
-            match_point_3=mp3,
-            seam_width=seam_width,
-        )
-        save_image(save_path_2, stitched_rgb)
-        stitched_frame = stitch_image(
-            image=first_frame_x,
-            match_point_1=mp1,
-            match_point_2=mp2,
-            match_point_3=mp3,
-        )
-        stitched_shape = (int(stitched_frame.shape[0]), int(stitched_frame.shape[1]))
-
-        patch_specs = build_patch_specs_for_stitched(
-            stitched_shape=stitched_shape,
-            pre_stitch_shape=(h, w),
-            tile_size=tile_size,
-            seam_width=seam_width,
-            match_point_1=mp1,
-            match_point_2=mp2,
-            match_point_3=mp3,
-            coverage_ratio=float(coverage_ratio),
-            min_patch_size=int(min_patch_size),
-        )
-        core_specs = {
-            spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
-            for spec in patch_specs
-        }
-        crop_mask = build_patch_boundary_mask(
-            stitched_shape=stitched_shape,
-            patch_specs=patch_specs,
-            seam_width=seam_width,
-        )
-        crop_overlay = overlay_white_lines(stitched_frame, crop_mask)
-        save_image(save_path_3, crop_overlay)
-        seam_only = np.zeros((stitched_shape[0], stitched_shape[1], 3), dtype=np.uint8)
-        seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
-        save_image(save_path_4, seam_only)
-    else:
-        seam_width = int(seam_width)
-        y_h, y_w = first_frame_y.shape
-        patch_specs = build_patch_specs_regular_grid(
-            image_shape=(y_h, y_w),
-            tile_size=tile_size,
-        )
-        if not patch_specs:
-            raise ValueError(f"No valid patches for input shape {(y_h, y_w)}")
-        core_specs = {
-            spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
-            for spec in patch_specs
-        }
-
-        vis_seam_width = max(2, seam_width)
-        crop_mask = build_patch_boundary_mask(
-            stitched_shape=(y_h, y_w),
-            patch_specs=patch_specs,
-            seam_width=vis_seam_width,
-        )
-        crop_overlay = overlay_white_lines(first_frame_y, crop_mask)
-        seam_only = np.zeros((y_h, y_w, 3), dtype=np.uint8)
-        seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
-        save_image(save_path_1, crop_overlay)
-        save_image(save_path_2, seam_only)
-        save_image(save_path_3, crop_overlay)
-        save_image(save_path_4, seam_only)
+    should_save_model_products = resolved_model_load_fold.is_dir()
 
     tifffile.imwrite(save_path_first_frame_x, first_frame_x)
     tifffile.imwrite(save_path_first_frame_y, first_frame_y)
@@ -985,16 +842,17 @@ def run(
                 chunk_size=int(chunk_size),
             )
 
-        save_model_products_stitched(
-            y_load_path=y_input_path,
-            model_load_fold_cfg=model_load_fold,
-            core_specs=core_specs,
-            save_dir=plot_dir,
-            downsample_factor=factor,
-            chunk_size=int(chunk_size),
-            model_workers=model_workers,
-            model_memory_fraction=float(model_memory_fraction),
-        )
+        if should_save_model_products:
+            save_model_products_stitched(
+                y_load_path=y_input_path,
+                model_load_fold_cfg=str(resolved_model_load_fold),
+                core_specs=core_specs,
+                save_dir=plot_dir,
+                downsample_factor=factor,
+                chunk_size=int(chunk_size),
+                model_workers=model_workers,
+                model_memory_fraction=float(model_memory_fraction),
+            )
 
 
 class Save:
@@ -1004,15 +862,9 @@ class Save:
         y_load_path: str,
         model_load_fold: str | None,
         save_fold: str | None,
+        para_load_path: str | None,
         downsample_factor: object,
         chunk_size: int,
-        seam_width: int,
-        tile_size: int,
-        match_point_1: object,
-        match_point_2: object,
-        match_point_3: object,
-        coverage_ratio: float,
-        min_patch_size: int,
         model_workers: int | None = None,
         model_memory_fraction: float = 0.55,
         **kwargs,
@@ -1021,15 +873,9 @@ class Save:
         self.y_load_path = y_load_path
         self.model_load_fold = model_load_fold
         self.save_fold = save_fold
+        self.para_load_path = para_load_path
         self.downsample_factor = downsample_factor
         self.chunk_size = int(chunk_size)
-        self.seam_width = int(seam_width)
-        self.tile_size = int(tile_size)
-        self.match_point_1 = match_point_1
-        self.match_point_2 = match_point_2
-        self.match_point_3 = match_point_3
-        self.coverage_ratio = float(coverage_ratio)
-        self.min_patch_size = int(min_patch_size)
         self.model_workers = (
             None if model_workers is None else int(model_workers)
         )
@@ -1041,15 +887,9 @@ class Save:
             y_load_path=self.y_load_path,
             model_load_fold=self.model_load_fold,
             save_fold=self.save_fold,
+            para_load_path=self.para_load_path,
             downsample_factor=self.downsample_factor,
             chunk_size=self.chunk_size,
-            seam_width=self.seam_width,
-            tile_size=self.tile_size,
-            match_point_1=self.match_point_1,
-            match_point_2=self.match_point_2,
-            match_point_3=self.match_point_3,
-            coverage_ratio=self.coverage_ratio,
-            min_patch_size=self.min_patch_size,
             model_workers=self.model_workers,
             model_memory_fraction=self.model_memory_fraction,
         )
