@@ -1,5 +1,6 @@
 import logging
 import os
+import warnings
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,24 @@ CNMFE_GROUPS = (
     "merging",
 )
 
+KNOWN_CNMFE_WARNING_FILTERS = (
+    (
+        r"divide by zero encountered in remainder",
+        r"scipy\.sparse\._dia",
+        "scipy.sparse._dia",
+    ),
+    (
+        r"divide by zero encountered in divide",
+        r"caiman\.source_extraction\.cnmf\.merging",
+        "caiman.source_extraction.cnmf.merging",
+    ),
+    (
+        r"invalid value encountered in divide",
+        r"caiman\.source_extraction\.cnmf\.merging",
+        "caiman.source_extraction.cnmf.merging",
+    ),
+)
+
 
 def _to_container(value: Any) -> Any:
     if omegaconf.OmegaConf.is_config(value):
@@ -50,6 +69,28 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(logging.NullHandler())
     logging.getLogger().setLevel(logging.ERROR)
     return logger
+
+
+def configure_warning_filters() -> None:
+    for message, module_regex, _ in KNOWN_CNMFE_WARNING_FILTERS:
+        warnings.filterwarnings(
+            "ignore",
+            message=message,
+            category=RuntimeWarning,
+            module=module_regex,
+        )
+
+    existing = os.environ.get("PYTHONWARNINGS", "")
+    env_specs = [
+        f"ignore:{message}:RuntimeWarning:{module_name}"
+        for message, _, module_name in KNOWN_CNMFE_WARNING_FILTERS
+    ]
+    missing_specs = [spec for spec in env_specs if spec not in existing.split(",")]
+    if not missing_specs:
+        return
+    os.environ["PYTHONWARNINGS"] = ",".join(
+        [part for part in [existing, *missing_specs] if part]
+    )
 
 
 def resolve_input_movies(y_load_fold_cfg: Any) -> tuple[list[Path], Path]:
@@ -178,6 +219,10 @@ def run_single_patch(
     save_model(cnm, movie_path, model_dir, logger)
 
 
+def get_model_path(movie_path: Path, model_dir: Path) -> Path:
+    return model_dir / f"{movie_path.name}.hdf5"
+
+
 def save_model(
     cnm: cnmf.CNMF,
     fname: Path,
@@ -185,7 +230,7 @@ def save_model(
     logger: logging.Logger,
 ) -> None:
     os.makedirs(model_dir, exist_ok=True)
-    model_path = model_dir / f"{fname.name}.hdf5"
+    model_path = get_model_path(fname, model_dir)
     cnm.save(str(model_path))
     logger.info("[%s] model saved: %s", fname.name, model_path)
 
@@ -224,16 +269,26 @@ class Extract:
         self.cfg = omegaconf.OmegaConf.create(cfg_dict)
 
     def forward(self) -> None:
+        configure_warning_filters()
         logger = setup_logger()
         movie_paths, auto_model_dir = resolve_input_movies(self.cfg.extract.y_load_fold)
         model_dir = resolve_model_dir(self.cfg.extract.model_save_fold, auto_model_dir)
         logger.info("Resolved %d .tif files. model dir: %s", len(movie_paths), model_dir)
+        pending_movie_paths: list[Path] = []
+        skipped_count = 0
+        for movie_path in movie_paths:
+            if get_model_path(movie_path, model_dir).is_file():
+                skipped_count += 1
+            else:
+                pending_movie_paths.append(movie_path)
 
         with silence_stdio():
             _, dview, n_processes = caiman.cluster.setup_cluster()
         try:
             for movie_path in tqdm.tqdm(
-                movie_paths,
+                pending_movie_paths,
+                total=len(movie_paths),
+                initial=skipped_count,
                 desc="extract",
                 unit="patch",
                 dynamic_ncols=True,

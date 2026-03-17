@@ -754,6 +754,67 @@ def save_downsampled_tif(
                     )
 
 
+def save_time_mean_tif(
+    x_path: Path,
+    out_path: Path,
+    chunk_size: int,
+) -> None:
+    chunk = int(chunk_size)
+    if chunk <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk}")
+
+    with tifffile.TiffFile(x_path) as tif:
+        video = zarr.open(tif.aszarr(), mode="r")
+        if video.ndim == 2:
+            tifffile.imwrite(
+                out_path,
+                np.asarray(video, dtype=np.float32),
+                photometric="minisblack",
+            )
+            return
+
+        if video.ndim != 3:
+            raise ValueError(f"Expected 2D or 3D TIFF, got ndim={video.ndim}: {x_path}")
+
+        t = int(video.shape[0])
+        h = int(video.shape[1])
+        w = int(video.shape[2])
+        acc = np.zeros((h, w), dtype=np.float64)
+        for start in range(0, t, chunk):
+            end = min(start + chunk, t)
+            chunk_data = np.asarray(video[start:end], dtype=np.float32)
+            acc += chunk_data.sum(axis=0, dtype=np.float64)
+            del chunk_data
+
+    mean_frame = (acc / max(t, 1)).astype(np.float32)
+    tifffile.imwrite(
+        out_path,
+        mean_frame,
+        photometric="minisblack",
+    )
+
+
+def _is_complete_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _model_output_paths(save_dir: Path, factor: int) -> list[Path]:
+    bf_name = "Bf.tif" if factor == 1 else f"Bf-d{factor}.tif"
+    b_name = "B.tif" if factor == 1 else f"B-d{factor}.tif"
+    ac_name = "AC.tif" if factor == 1 else f"AC-d{factor}.tif"
+    return [
+        save_dir / "Bc.tif",
+        save_dir / "Asum.tif",
+        save_dir / "ACsum.tif",
+        save_dir / bf_name,
+        save_dir / b_name,
+        save_dir / ac_name,
+    ]
+
+
 def normalize_downsample_factors(raw: object) -> list[int]:
     if isinstance(raw, (int, np.integer)):
         factors = [int(raw)]
@@ -803,19 +864,9 @@ def run(
     downsample_factors = normalize_downsample_factors(downsample_factor)
     save_path_first_frame_x = plot_dir / f"{x_base}-f0.tif"
     save_path_first_frame_y = plot_dir / f"{y_base}-f0.tif"
-
-    first_frame_x = read_first_frame(input_path)
-    first_frame_y = read_first_frame(y_input_path)
+    save_path_mean_y = plot_dir / f"{y_base}sum.tif"
 
     plot_dir.mkdir(parents=True, exist_ok=True)
-    if para_load_path is None:
-        raise ValueError("save requires para_load_path pointing to crop para.json.")
-    crop_params = load_crop_params(Path(para_load_path))
-    patch_specs = crop_params["patch_specs"]
-    core_specs = {
-        spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
-        for spec in patch_specs
-    }
     resolved_model_load_fold = (
         y_input_path.parent / "model"
         if model_load_fold is None
@@ -823,36 +874,63 @@ def run(
     )
     should_save_model_products = resolved_model_load_fold.is_dir()
 
-    tifffile.imwrite(save_path_first_frame_x, first_frame_x)
-    tifffile.imwrite(save_path_first_frame_y, first_frame_y)
+    if not _is_complete_file(save_path_first_frame_x):
+        first_frame_x = read_first_frame(input_path)
+        tifffile.imwrite(save_path_first_frame_x, first_frame_x)
+
+    if not _is_complete_file(save_path_first_frame_y):
+        first_frame_y = read_first_frame(y_input_path)
+        tifffile.imwrite(save_path_first_frame_y, first_frame_y)
+
+    if not _is_complete_file(save_path_mean_y):
+        save_time_mean_tif(
+            x_path=y_input_path,
+            out_path=save_path_mean_y,
+            chunk_size=int(chunk_size),
+        )
+
+    core_specs: dict[str, tuple[int, int, int, int]] | None = None
     for factor in downsample_factors:
         if factor > 1:
             save_path_downsample_x = plot_dir / f"{x_base}-d{factor}.tif"
             save_path_downsample_y = plot_dir / f"{y_base}-d{factor}.tif"
-            save_downsampled_tif(
-                x_path=input_path,
-                out_path=save_path_downsample_x,
-                downsample_factor=factor,
-                chunk_size=int(chunk_size),
-            )
-            save_downsampled_tif(
-                x_path=y_input_path,
-                out_path=save_path_downsample_y,
-                downsample_factor=factor,
-                chunk_size=int(chunk_size),
-            )
+            if not _is_complete_file(save_path_downsample_x):
+                save_downsampled_tif(
+                    x_path=input_path,
+                    out_path=save_path_downsample_x,
+                    downsample_factor=factor,
+                    chunk_size=int(chunk_size),
+                )
+            if not _is_complete_file(save_path_downsample_y):
+                save_downsampled_tif(
+                    x_path=y_input_path,
+                    out_path=save_path_downsample_y,
+                    downsample_factor=factor,
+                    chunk_size=int(chunk_size),
+                )
 
         if should_save_model_products:
-            save_model_products_stitched(
-                y_load_path=y_input_path,
-                model_load_fold_cfg=str(resolved_model_load_fold),
-                core_specs=core_specs,
-                save_dir=plot_dir,
-                downsample_factor=factor,
-                chunk_size=int(chunk_size),
-                model_workers=model_workers,
-                model_memory_fraction=float(model_memory_fraction),
-            )
+            model_outputs = _model_output_paths(plot_dir, int(factor))
+            if not all(_is_complete_file(path) for path in model_outputs):
+                if para_load_path is None:
+                    raise ValueError("save requires para_load_path pointing to crop para.json.")
+                if core_specs is None:
+                    crop_params = load_crop_params(Path(para_load_path))
+                    patch_specs = crop_params["patch_specs"]
+                    core_specs = {
+                        spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
+                        for spec in patch_specs
+                    }
+                save_model_products_stitched(
+                    y_load_path=y_input_path,
+                    model_load_fold_cfg=str(resolved_model_load_fold),
+                    core_specs=core_specs,
+                    save_dir=plot_dir,
+                    downsample_factor=factor,
+                    chunk_size=int(chunk_size),
+                    model_workers=model_workers,
+                    model_memory_fraction=float(model_memory_fraction),
+                )
 
 
 class Save:

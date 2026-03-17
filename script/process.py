@@ -17,6 +17,10 @@ def main(cfg: omegaconf.DictConfig) -> None:
         cfg.stitch.result_save_fold = str(
             Path(cfg.stitch.y_save_path).parent / "stitch"
         )
+    if cfg.vessel.result_save_fold is None:
+        cfg.vessel.result_save_fold = str(
+            Path(cfg.vessel.y_save_path).parent / "vessel"
+        )
     if cfg.crop.y_save_fold is None:
         cfg.crop.y_save_fold = str(
             Path(cfg.crop.y_load_path).with_suffix("")
@@ -38,6 +42,8 @@ def main(cfg: omegaconf.DictConfig) -> None:
         src.Stitch(**cfg.stitch).forward()
     if cfg.normalize.enable:
         src.Normalize(**cfg.normalize).forward()
+    if cfg.vessel.enable:
+        src.Vessel(**cfg.vessel).forward()
     if cfg.crop.enable:
         src.Crop(**cfg.crop).forward()
     if cfg.extract.enable:

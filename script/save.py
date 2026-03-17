@@ -14,7 +14,7 @@ def main(cfg: omegaconf.DictConfig) -> None:
     if cfg.y_load_path is None:
         cfg.y_load_path = str(Path(cfg.x_load_path).parent / "Y.tif")
     if cfg.model_load_fold is None:
-        cfg.model_load_fold = str(Path(cfg.y_load_path).parent / "model")
+        cfg.model_load_fold = str(Path(cfg.y_load_path).parent / "extract")
     if cfg.save_fold is None:
         cfg.save_fold = str(Path(cfg.y_load_path).parent / "save")
     if cfg.para_load_path is None:

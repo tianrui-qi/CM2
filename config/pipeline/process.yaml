@@ -3,6 +3,7 @@
 defaults:
   - /schema/stitch@_here_
   - /schema/normalize@_here_
+  - /schema/vessel@_here_
   - /schema/crop@_here_
   - /schema/extract@_here_
   - _self_
@@ -24,16 +25,23 @@ normalize:
   y_save_path: ${y_path}
   chunk_size: ${chunk_size}
 
+vessel:
+  enable: true
+  y_load_path: ${y_path}
+  y_save_path: ${y_path}
+  result_save_fold: null  # default: [parent of y_save_path]/vessel/
+  chunk_size: ${chunk_size}
+
 crop:
   enable: true
   x_load_path: ${x_path}
   y_load_path: ${y_path}
   para_load_path: null    # default: [parent of y_save_fold]/stitch/para.json
   y_save_fold: null       # default: y_load_path without suffix
-  result_save_fold: null  # default: [parent of y_save_path]/crop
+  result_save_fold: null  # default: [parent of y_save_path]/crop/
   chunk_size: ${chunk_size}
 
 extract:
   enable: true
   y_load_fold: ${crop.y_save_fold}
-  model_save_fold: null   # default: [parent of y_load_fold]/model
+  model_save_fold: null   # default: [parent of y_load_fold]/extract/
