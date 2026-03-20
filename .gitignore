@@ -1,13 +1,13 @@
-/data/*
-!data/stitch/
-/data/stitch/**
-!data/stitch/para.json
-!data/stitch/L/
-!data/stitch/L/para.json
-!data/stitch/R/
-!data/stitch/R/para.json
-!data/stitch/LR/
-!data/stitch/LR/para.json
+/data/
+# !data/stitch/
+# /data/stitch/**
+# !data/stitch/para.json
+# !data/stitch/L/
+# !data/stitch/L/para.json
+# !data/stitch/R/
+# !data/stitch/R/para.json
+# !data/stitch/LR/
+# !data/stitch/LR/para.json
 
 # temp folder and files
 **/temp/
