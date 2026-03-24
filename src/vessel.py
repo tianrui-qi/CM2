@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import os
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -63,7 +61,7 @@ def compute_summary_mean(
         with tqdm.tqdm(
             total=total_chunks,
             unit="chunk",
-            desc="vessel(1/2)",
+            desc="vessel",
             dynamic_ncols=True,
         ) as bar:
             for start in range(0, video.shape[0], chunk_size):
@@ -88,7 +86,7 @@ def build_vessel_outputs(
     mask_close_radius: int,
     mask_dilation_radius: int,
     input_percentiles: Sequence[float],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     frame_frangi_input = rescale_to_unit(
         summary_raw,
         float(input_percentiles[0]),
@@ -134,31 +132,22 @@ def build_vessel_outputs(
             footprint=morphology.disk(int(mask_dilation_radius)),
         )
 
-    summary_mask_applied = np.where(mask_clean, 0.0, summary_raw).astype(np.float32)
     return (
         vesselness,
         mask_initial.astype(bool),
         mask_clean.astype(bool),
-        summary_mask_applied,
     )
 
 
 def save_result_images(
     result_save_fold: str,
-    summary_raw: np.ndarray,
     vesselness: np.ndarray,
     mask_initial: np.ndarray,
     mask_clean: np.ndarray,
-    summary_mask_applied: np.ndarray,
 ) -> None:
     save_dir = Path(result_save_fold)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    tifffile.imwrite(
-        save_dir / "raw_summary.tif",
-        np.asarray(summary_raw, dtype=np.float32),
-        photometric="minisblack",
-    )
     tifffile.imwrite(
         save_dir / "frangi_vesselness.tif",
         np.asarray(vesselness, dtype=np.float32),
@@ -174,66 +163,12 @@ def save_result_images(
         (np.asarray(mask_clean, dtype=np.uint8) * 255),
         photometric="minisblack",
     )
-    tifffile.imwrite(
-        save_dir / "raw_mask_applied.tif",
-        np.asarray(summary_mask_applied, dtype=np.float32),
-        photometric="minisblack",
-    )
-
-
-def apply_mask_and_save_video(
-    y_load_path: str,
-    y_save_path: str,
-    mask_clean: np.ndarray,
-    chunk_size: int,
-    dtype: str,
-) -> None:
-    Path(y_save_path).parent.mkdir(parents=True, exist_ok=True)
-    same_path = os.path.abspath(y_load_path) == os.path.abspath(y_save_path)
-    if not same_path:
-        tmp_path = y_save_path
-    else:
-        tmp_path = y_save_path + ".tmp_vessel.tif"
-
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-
-    tif, video, _ = _open_video_as_3d(y_load_path)
-    try:
-        total_chunks = (video.shape[0] + chunk_size - 1) // chunk_size
-        with tifffile.TiffWriter(tmp_path, bigtiff=True) as writer:
-            with tqdm.tqdm(
-                total=total_chunks,
-                unit="chunk",
-                desc="vessel(2/2)",
-                dynamic_ncols=True,
-            ) as bar:
-                for start in range(0, video.shape[0], chunk_size):
-                    end = min(start + chunk_size, video.shape[0])
-                    chunk = np.asarray(video[start:end], dtype=np.float32)
-                    if chunk.ndim == 2:
-                        chunk = chunk[None, ...]
-                    chunk = np.where(mask_clean[None, ...], 0.0, chunk).astype(
-                        dtype,
-                        copy=False,
-                    )
-                    for frame in chunk:
-                        writer.write(frame, contiguous=True)
-                    del chunk
-                    bar.update(1)
-    finally:
-        tif.close()
-
-    if same_path:
-        os.replace(tmp_path, y_save_path)
 
 
 def run(
     y_load_path: str,
-    y_save_path: str,
     result_save_fold: str,
     chunk_size: int,
-    dtype: str,
     frangi_sigmas: Sequence[float],
     frangi_black_ridges: bool,
     mask_percentile: float,
@@ -246,7 +181,7 @@ def run(
         y_load_path=y_load_path,
         chunk_size=chunk_size,
     )
-    vesselness, mask_initial, mask_clean, summary_mask_applied = build_vessel_outputs(
+    vesselness, mask_initial, mask_clean = build_vessel_outputs(
         summary_raw=summary_raw,
         frangi_sigmas=frangi_sigmas,
         frangi_black_ridges=frangi_black_ridges,
@@ -258,18 +193,9 @@ def run(
     )
     save_result_images(
         result_save_fold=result_save_fold,
-        summary_raw=summary_raw,
         vesselness=vesselness,
         mask_initial=mask_initial,
         mask_clean=mask_clean,
-        summary_mask_applied=summary_mask_applied,
-    )
-    apply_mask_and_save_video(
-        y_load_path=y_load_path,
-        y_save_path=y_save_path,
-        mask_clean=mask_clean,
-        chunk_size=chunk_size,
-        dtype=dtype,
     )
 
 
@@ -277,10 +203,8 @@ class Vessel:
     def __init__(
         self,
         y_load_path: str,
-        y_save_path: str,
         result_save_fold: str,
         chunk_size: int,
-        dtype: str,
         frangi_sigmas: Sequence[float],
         frangi_black_ridges: bool,
         mask_percentile: float,
@@ -291,10 +215,8 @@ class Vessel:
         **kwargs,
     ) -> None:
         self.y_load_path = str(y_load_path)
-        self.y_save_path = str(y_save_path)
         self.result_save_fold = str(result_save_fold)
         self.chunk_size = int(chunk_size)
-        self.dtype = str(dtype)
         self.frangi_sigmas = tuple(float(x) for x in frangi_sigmas)
         self.frangi_black_ridges = bool(frangi_black_ridges)
         self.mask_percentile = float(mask_percentile)
@@ -306,10 +228,8 @@ class Vessel:
     def forward(self) -> None:
         run(
             y_load_path=self.y_load_path,
-            y_save_path=self.y_save_path,
             result_save_fold=self.result_save_fold,
             chunk_size=self.chunk_size,
-            dtype=self.dtype,
             frangi_sigmas=self.frangi_sigmas,
             frangi_black_ridges=self.frangi_black_ridges,
             mask_percentile=self.mask_percentile,

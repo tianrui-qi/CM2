@@ -7,7 +7,7 @@ model_load_fold: null   # default: [parent of y_load_path]/model
 save_fold: null         # default: [parent of y_load_path]/save
 chunk_size: 32
 # downsample
-downsample_factor: [1, 2]
+downsample_factor: [2]
 # model compute parallel
 model_workers: null         # null for auto
 model_memory_fraction: 0.5  # % memory for all workers

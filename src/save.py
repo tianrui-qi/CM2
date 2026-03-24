@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from collections.abc import Sequence
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack
 import logging
 import os
 import re
@@ -10,15 +11,19 @@ import tempfile
 
 import numpy as np
 import tifffile
+import tqdm
 import zarr
 
 from .crop import (
     load_crop_params,
-    read_first_frame,
 )
 
 
 PATCH_NAME_RE = re.compile(r"^(\d+)-(\d+)-(\d+)-(\d+)$")
+MODEL_STATIC_OUTPUT_ORDER = ("ACsum", "Asum", "Bc")
+MODEL_VIDEO_OUTPUT_ORDER = ("AC", "Bf", "B")
+MODEL_OUTPUT_ORDER = MODEL_STATIC_OUTPUT_ORDER + MODEL_VIDEO_OUTPUT_ORDER
+MODEL_BAR_LABEL_WIDTH = 5
 
 
 @dataclass
@@ -359,12 +364,19 @@ def _process_single_patch_to_temp(
     bf_name: str,
     b_name: str,
     ac_name: str,
+    save_bc: bool,
+    save_asum: bool,
+    save_acsum: bool,
+    save_bf: bool,
+    save_b: bool,
+    save_ac: bool,
 ) -> tuple[str, int]:
     from caiman.source_extraction.cnmf.cnmf import load_CNMF
 
     logging.getLogger("caiman").setLevel(logging.ERROR)
     patch_dir = tmp_dir / p.patch_name
     patch_dir.mkdir(parents=True, exist_ok=True)
+    need_video = bool(save_bf or save_b or save_ac)
 
     cnm = load_CNMF(str(p.model_path), n_processes=1, dview=None)
     dims = tuple(int(x) for x in list(cnm.dims)[:2])
@@ -391,111 +403,152 @@ def _process_single_patch_to_temp(
             f"b0 size mismatch for {p.patch_name}: {b0.size} vs {p.h * p.w}"
         )
 
-    W = getattr(cnm.estimates, "W", None)
-    if W is None:
+    W = getattr(cnm.estimates, "W", None) if (save_bf or save_b) else None
+    if (save_bf or save_b) and W is None:
         raise ValueError(f"Model has no W for {p.patch_name}: {p.model_path}")
 
     t_use = min(p.t, int(C.shape[1]))
     if t_use <= 0:
         raise ValueError(f"No valid frames for patch: {p.patch_name}")
 
-    bc_patch = b0.reshape((p.h, p.w), order="F").astype(np.float32, copy=False)
-    asum_patch = np.asarray(A.sum(axis=1), dtype=np.float32).reshape(-1)
-    asum_patch = asum_patch.reshape((p.h, p.w), order="F").astype(
-        np.float32, copy=False
-    )
-    csum = C[:, :t_use].sum(axis=1, dtype=np.float32)
-    acsum_patch = np.asarray(A @ csum, dtype=np.float32).reshape(-1)
-    acsum_patch = acsum_patch.reshape((p.h, p.w), order="F").astype(
-        np.float32, copy=False
-    )
-    bc_core = bc_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-    asum_core = asum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-    acsum_core = acsum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-    bc_down = bc_patch[
-        p.ds_ly0 : p.core_ly1 : factor,
-        p.ds_lx0 : p.core_lx1 : factor,
-    ]
+    need_bc_patch = bool(save_bc or save_b)
+    if save_bc or save_asum or save_acsum or need_bc_patch:
+        bc_patch = b0.reshape((p.h, p.w), order="F").astype(np.float32, copy=False)
+    else:
+        bc_patch = None
 
-    tifffile.imwrite(
-        patch_dir / "Bc.tif", bc_core, imagej=True, metadata={"axes": "YX"}
-    )
-    tifffile.imwrite(
-        patch_dir / "Asum.tif",
-        asum_core,
-        imagej=True,
-        metadata={"axes": "YX"},
-    )
-    tifffile.imwrite(
-        patch_dir / "ACsum.tif",
-        acsum_core,
-        imagej=True,
-        metadata={"axes": "YX"},
-    )
+    if save_asum:
+        asum_patch = np.asarray(A.sum(axis=1), dtype=np.float32).reshape(-1)
+        asum_patch = asum_patch.reshape((p.h, p.w), order="F").astype(
+            np.float32, copy=False
+        )
+        asum_core = asum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
+        tifffile.imwrite(
+            patch_dir / "Asum.tif",
+            asum_core,
+            imagej=True,
+            metadata={"axes": "YX"},
+        )
 
-    with tifffile.TiffFile(p.movie_path) as tif:
-        video = zarr.open(tif.aszarr(), mode="r")
-        if video.ndim != 3:
-            raise ValueError(f"Patch movie must be TYX, got ndim={video.ndim}: {p.movie_path}")
-        if int(video.shape[0]) < t_use:
-            raise ValueError(
-                f"Patch movie shorter than expected for {p.patch_name}: {video.shape[0]} < {t_use}"
+    if save_acsum:
+        csum = C[:, :t_use].sum(axis=1, dtype=np.float32)
+        acsum_patch = np.asarray(A @ csum, dtype=np.float32).reshape(-1)
+        acsum_patch = acsum_patch.reshape((p.h, p.w), order="F").astype(
+            np.float32, copy=False
+        )
+        acsum_core = acsum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
+        tifffile.imwrite(
+            patch_dir / "ACsum.tif",
+            acsum_core,
+            imagej=True,
+            metadata={"axes": "YX"},
+        )
+
+    bc_down: np.ndarray | None = None
+    if bc_patch is not None:
+        if save_bc:
+            bc_core = bc_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
+            tifffile.imwrite(
+                patch_dir / "Bc.tif",
+                bc_core,
+                imagej=True,
+                metadata={"axes": "YX"},
             )
+        if save_b:
+            bc_down = bc_patch[
+                p.ds_ly0 : p.core_ly1 : factor,
+                p.ds_lx0 : p.core_lx1 : factor,
+            ]
 
-        with tifffile.TiffWriter(
-            patch_dir / bf_name,
-            bigtiff=True,
-        ) as writer_bf, tifffile.TiffWriter(
-            patch_dir / b_name,
-            bigtiff=True,
-        ) as writer_b, tifffile.TiffWriter(
-            patch_dir / ac_name,
-            bigtiff=True,
-        ) as writer_ac:
-            for start in range(0, t_use, model_chunk):
-                end = min(start + model_chunk, t_use)
-                tc = end - start
-                block = np.asarray(video[start:end], dtype=np.float32)
-                y_mat = np.transpose(block, (1, 2, 0)).reshape(
-                    (p.h * p.w, tc), order="F"
+    if need_video:
+        with tifffile.TiffFile(p.movie_path) as tif:
+            video = zarr.open(tif.aszarr(), mode="r")
+            if video.ndim != 3:
+                raise ValueError(
+                    f"Patch movie must be TYX, got ndim={video.ndim}: {p.movie_path}"
+                )
+            if int(video.shape[0]) < t_use:
+                raise ValueError(
+                    f"Patch movie shorter than expected for {p.patch_name}: {video.shape[0]} < {t_use}"
                 )
 
-                c_chunk = C[:, start:end]
-                ac_mat = np.asarray(A @ c_chunk, dtype=np.float32)
-                residual = y_mat - ac_mat - b0[:, None]
-                bf_mat = np.asarray(W @ residual, dtype=np.float32)
-
-                ac_frames = ac_mat.T.reshape((tc, p.h, p.w), order="F")
-                bf_frames = bf_mat.T.reshape((tc, p.h, p.w), order="F")
-
-                ac_down = ac_frames[
-                    :,
-                    p.ds_ly0 : p.core_ly1 : factor,
-                    p.ds_lx0 : p.core_lx1 : factor,
-                ]
-                bf_down = bf_frames[
-                    :,
-                    p.ds_ly0 : p.core_ly1 : factor,
-                    p.ds_lx0 : p.core_lx1 : factor,
-                ]
-                b_down = bf_down + bc_down[None, :, :]
-
-                for i in range(tc):
-                    writer_bf.write(
-                        bf_down[i].astype(np.float32, copy=False),
-                        contiguous=True,
-                        photometric="minisblack",
+            with ExitStack() as stack:
+                writer_bf = (
+                    stack.enter_context(
+                        tifffile.TiffWriter(patch_dir / bf_name, bigtiff=True)
                     )
-                    writer_b.write(
-                        b_down[i].astype(np.float32, copy=False),
-                        contiguous=True,
-                        photometric="minisblack",
+                    if save_bf
+                    else None
+                )
+                writer_b = (
+                    stack.enter_context(
+                        tifffile.TiffWriter(patch_dir / b_name, bigtiff=True)
                     )
-                    writer_ac.write(
-                        ac_down[i].astype(np.float32, copy=False),
-                        contiguous=True,
-                        photometric="minisblack",
+                    if save_b
+                    else None
+                )
+                writer_ac = (
+                    stack.enter_context(
+                        tifffile.TiffWriter(patch_dir / ac_name, bigtiff=True)
                     )
+                    if save_ac
+                    else None
+                )
+
+                for start in range(0, t_use, model_chunk):
+                    end = min(start + model_chunk, t_use)
+                    tc = end - start
+                    c_chunk = C[:, start:end]
+                    ac_mat = np.asarray(A @ c_chunk, dtype=np.float32)
+                    ac_frames = ac_mat.T.reshape((tc, p.h, p.w), order="F")
+                    ac_down = ac_frames[
+                        :,
+                        p.ds_ly0 : p.core_ly1 : factor,
+                        p.ds_lx0 : p.core_lx1 : factor,
+                    ]
+
+                    if save_ac and writer_ac is not None:
+                        for i in range(tc):
+                            writer_ac.write(
+                                ac_down[i].astype(np.float32, copy=False),
+                                contiguous=True,
+                                photometric="minisblack",
+                            )
+
+                    if save_bf or save_b:
+                        block = np.asarray(video[start:end], dtype=np.float32)
+                        y_mat = np.transpose(block, (1, 2, 0)).reshape(
+                            (p.h * p.w, tc), order="F"
+                        )
+                        residual = y_mat - ac_mat - b0[:, None]
+                        bf_mat = np.asarray(W @ residual, dtype=np.float32)
+                        bf_frames = bf_mat.T.reshape((tc, p.h, p.w), order="F")
+                        bf_down = bf_frames[
+                            :,
+                            p.ds_ly0 : p.core_ly1 : factor,
+                            p.ds_lx0 : p.core_lx1 : factor,
+                        ]
+
+                        if save_bf and writer_bf is not None:
+                            for i in range(tc):
+                                writer_bf.write(
+                                    bf_down[i].astype(np.float32, copy=False),
+                                    contiguous=True,
+                                    photometric="minisblack",
+                                )
+
+                        if save_b and writer_b is not None:
+                            if bc_down is None:
+                                raise RuntimeError(
+                                    f"Missing bc_down while writing B for {p.patch_name}"
+                                )
+                            b_down = bf_down + bc_down[None, :, :]
+                            for i in range(tc):
+                                writer_b.write(
+                                    b_down[i].astype(np.float32, copy=False),
+                                    contiguous=True,
+                                    photometric="minisblack",
+                                )
 
     return p.patch_name, int(t_use)
 
@@ -526,7 +579,13 @@ def _stitch_video_from_temp(
             arrays.append(arr)
 
         with tifffile.TiffWriter(out_path, bigtiff=True) as writer:
-            for t in range(global_t):
+            for t in tqdm.tqdm(
+                range(global_t),
+                total=global_t,
+                desc=_format_model_bar_desc(out_path.stem, "<-"),
+                unit="frame",
+                dynamic_ncols=True,
+            ):
                 frame = np.zeros((full_h_ds, full_w_ds), dtype=np.float32)
                 for p, arr in zip(patches, arrays):
                     patch_frame = np.asarray(arr[t], dtype=np.float32)
@@ -550,13 +609,22 @@ def save_model_products_stitched(
     chunk_size: int,
     model_workers: int | None,
     model_memory_fraction: float,
+    requested_output_names: Sequence[str] | None = None,
 ) -> None:
     factor = int(downsample_factor)
-    if factor <= 0:
-        raise ValueError(f"downsample_factor must be > 0, got {factor}")
+    if factor < 2:
+        raise ValueError(f"downsample_factor must be >= 2, got {factor}")
     bf_name = "Bf.tif" if factor == 1 else f"Bf-d{factor}.tif"
     b_name = "B.tif" if factor == 1 else f"B-d{factor}.tif"
     ac_name = "AC.tif" if factor == 1 else f"AC-d{factor}.tif"
+    missing_outputs = _get_missing_model_outputs(
+        save_dir=save_dir,
+        factor=factor,
+        requested_output_names=requested_output_names,
+    )
+    if not missing_outputs:
+        return
+    output_paths = _model_output_path_map(save_dir, factor)
     chunk = int(chunk_size)
     if chunk <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk}")
@@ -621,7 +689,13 @@ def save_model_products_stitched(
         # Phase 1: compute each patch result and save locally (memory-friendly).
         t_use_by_patch: dict[str, int] = {}
         if workers <= 1:
-            for p in patches:
+            for p in tqdm.tqdm(
+                patches,
+                total=len(patches),
+                desc=_format_model_bar_desc("model", "->"),
+                unit="patch",
+                dynamic_ncols=True,
+            ):
                 patch_name, t_use = _process_single_patch_to_temp(
                     p=p,
                     tmp_dir=tmp_dir,
@@ -630,6 +704,12 @@ def save_model_products_stitched(
                     bf_name=bf_name,
                     b_name=b_name,
                     ac_name=ac_name,
+                    save_bc="Bc" in missing_outputs,
+                    save_asum="Asum" in missing_outputs,
+                    save_acsum="ACsum" in missing_outputs,
+                    save_bf="Bf" in missing_outputs,
+                    save_b="B" in missing_outputs,
+                    save_ac="AC" in missing_outputs,
                 )
                 t_use_by_patch[patch_name] = t_use
         else:
@@ -644,12 +724,25 @@ def save_model_products_stitched(
                         bf_name,
                         b_name,
                         ac_name,
+                        "Bc" in missing_outputs,
+                        "Asum" in missing_outputs,
+                        "ACsum" in missing_outputs,
+                        "Bf" in missing_outputs,
+                        "B" in missing_outputs,
+                        "AC" in missing_outputs,
                     )
                     for p in patches
                 ]
-                for future in as_completed(futures):
-                    patch_name, t_use = future.result()
-                    t_use_by_patch[patch_name] = t_use
+                with tqdm.tqdm(
+                    total=len(futures),
+                    desc=_format_model_bar_desc("model", "->"),
+                    unit="patch",
+                    dynamic_ncols=True,
+                ) as pbar:
+                    for future in as_completed(futures):
+                        patch_name, t_use = future.result()
+                        t_use_by_patch[patch_name] = t_use
+                        pbar.update(1)
 
         for p in patches:
             if p.patch_name not in t_use_by_patch:
@@ -661,52 +754,63 @@ def save_model_products_stitched(
         if global_t <= 0:
             raise ValueError("No frames available after per-patch model processing.")
 
-        for patch_name, out_name in (
-            ("Bc.tif", "Bc.tif"),
-            ("Asum.tif", "Asum.tif"),
-            ("ACsum.tif", "ACsum.tif"),
+        for output_name, patch_name in (
+            ("ACsum", "ACsum.tif"),
+            ("Asum", "Asum.tif"),
+            ("Bc", "Bc.tif"),
         ):
+            if output_name not in missing_outputs:
+                continue
             full_2d = np.zeros((full_h, full_w), dtype=np.float32)
-            for p in patches:
+            for p in tqdm.tqdm(
+                patches,
+                total=len(patches),
+                desc=_format_model_bar_desc(output_name, "<-"),
+                unit="patch",
+                dynamic_ncols=True,
+            ):
                 patch_dir = tmp_dir / p.patch_name
                 patch_2d = tifffile.imread(patch_dir / patch_name).astype(
                     np.float32, copy=False
                 )
                 full_2d[p.y0 : p.y1, p.x0 : p.x1] = patch_2d
             tifffile.imwrite(
-                save_dir / out_name,
+                output_paths[output_name],
                 full_2d,
                 imagej=True,
                 metadata={"axes": "YX"},
             )
 
-        _stitch_video_from_temp(
-            patches=patches,
-            tmp_root=tmp_dir,
-            patch_video_name=bf_name,
-            out_path=save_dir / bf_name,
-            full_h_ds=full_h_ds,
-            full_w_ds=full_w_ds,
-            global_t=global_t,
-        )
-        _stitch_video_from_temp(
-            patches=patches,
-            tmp_root=tmp_dir,
-            patch_video_name=b_name,
-            out_path=save_dir / b_name,
-            full_h_ds=full_h_ds,
-            full_w_ds=full_w_ds,
-            global_t=global_t,
-        )
-        _stitch_video_from_temp(
-            patches=patches,
-            tmp_root=tmp_dir,
-            patch_video_name=ac_name,
-            out_path=save_dir / ac_name,
-            full_h_ds=full_h_ds,
-            full_w_ds=full_w_ds,
-            global_t=global_t,
-        )
+        if "AC" in missing_outputs:
+            _stitch_video_from_temp(
+                patches=patches,
+                tmp_root=tmp_dir,
+                patch_video_name=ac_name,
+                out_path=output_paths["AC"],
+                full_h_ds=full_h_ds,
+                full_w_ds=full_w_ds,
+                global_t=global_t,
+            )
+        if "Bf" in missing_outputs:
+            _stitch_video_from_temp(
+                patches=patches,
+                tmp_root=tmp_dir,
+                patch_video_name=bf_name,
+                out_path=output_paths["Bf"],
+                full_h_ds=full_h_ds,
+                full_w_ds=full_w_ds,
+                global_t=global_t,
+            )
+        if "B" in missing_outputs:
+            _stitch_video_from_temp(
+                patches=patches,
+                tmp_root=tmp_dir,
+                patch_video_name=b_name,
+                out_path=output_paths["B"],
+                full_h_ds=full_h_ds,
+                full_w_ds=full_w_ds,
+                global_t=global_t,
+            )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -718,8 +822,8 @@ def save_downsampled_tif(
     chunk_size: int,
 ) -> None:
     factor = int(downsample_factor)
-    if factor <= 0:
-        raise ValueError(f"downsample_factor must be > 0, got {factor}")
+    if factor < 2:
+        raise ValueError(f"downsample_factor must be >= 2, got {factor}")
     chunk = int(chunk_size)
     if chunk <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk}")
@@ -741,8 +845,15 @@ def save_downsampled_tif(
             raise ValueError(f"Expected 2D or 3D TIFF, got ndim={video.ndim}: {x_path}")
 
         t = int(video.shape[0])
+        total_chunks = (t + chunk - 1) // chunk
         with tifffile.TiffWriter(out_path, bigtiff=True) as writer:
-            for start in range(0, t, chunk):
+            for start in tqdm.tqdm(
+                range(0, t, chunk),
+                total=total_chunks,
+                desc=f"save({out_path.stem})",
+                unit="chunk",
+                dynamic_ncols=True,
+            ):
                 end = min(start + chunk, t)
                 chunk_data = np.asarray(video[start:end])
                 down = chunk_data[:, ::factor, ::factor]
@@ -794,6 +905,198 @@ def save_time_mean_tif(
     )
 
 
+def save_time_mean_std_tif(
+    x_path: Path,
+    mean_out_path: Path,
+    std_out_path: Path,
+    chunk_size: int,
+    save_mean: bool = True,
+    save_std: bool = True,
+) -> None:
+    chunk = int(chunk_size)
+    if chunk <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk}")
+    if not save_mean and not save_std:
+        return
+    stats_label = ",".join(
+        label
+        for enabled, label in (
+            (save_mean, mean_out_path.stem),
+            (save_std, std_out_path.stem),
+        )
+        if enabled
+    )
+
+    with tifffile.TiffFile(x_path) as tif:
+        video = zarr.open(tif.aszarr(), mode="r")
+        if video.ndim == 2:
+            frame = np.asarray(video, dtype=np.float32)
+            if save_mean:
+                tifffile.imwrite(
+                    mean_out_path,
+                    frame,
+                    photometric="minisblack",
+                )
+            if save_std:
+                tifffile.imwrite(
+                    std_out_path,
+                    np.zeros_like(frame, dtype=np.float32),
+                    photometric="minisblack",
+                )
+            return
+
+        if video.ndim != 3:
+            raise ValueError(f"Expected 2D or 3D TIFF, got ndim={video.ndim}: {x_path}")
+
+        t = int(video.shape[0])
+        h = int(video.shape[1])
+        w = int(video.shape[2])
+
+        # Prefer a single pass over the time axis. The previous row-blocked
+        # version reread the full movie once per spatial block, which can make
+        # Ymean/Ystd several times slower on large TIFFs.
+        pixel_count = max(1, h * w)
+        float32_bytes = np.dtype(np.float32).itemsize
+        float64_bytes = np.dtype(np.float64).itemsize
+        target_stats_chunk_bytes = 128 * 1024 * 1024
+        stats_chunk = max(
+            1,
+            min(chunk, target_stats_chunk_bytes // max(1, pixel_count * float32_bytes)),
+        )
+
+        accumulator_bytes = pixel_count * float64_bytes * (1 + int(save_std))
+        scratch_bytes = stats_chunk * pixel_count * float32_bytes
+        mean_work_bytes = pixel_count * float64_bytes
+        estimated_working_set = accumulator_bytes + scratch_bytes + mean_work_bytes
+        available_memory = _get_available_memory_bytes()
+        can_use_single_pass = (
+            estimated_working_set <= 768 * 1024 * 1024
+            if available_memory is None
+            else estimated_working_set <= int(available_memory * 0.45)
+        )
+
+        if can_use_single_pass:
+            if save_mean and mean_out_path.exists():
+                mean_out_path.unlink()
+            if save_std and std_out_path.exists():
+                std_out_path.unlink()
+
+            mean_acc = np.zeros((h, w), dtype=np.float64)
+            sumsq_acc = (
+                np.zeros((h, w), dtype=np.float64)
+                if save_std
+                else None
+            )
+            total_chunks = (t + stats_chunk - 1) // stats_chunk
+            for start in tqdm.tqdm(
+                range(0, t, stats_chunk),
+                total=total_chunks,
+                desc=f"save({stats_label})",
+                unit="chunk",
+                dynamic_ncols=True,
+            ):
+                end = min(start + stats_chunk, t)
+                chunk_data = np.asarray(video[start:end], dtype=np.float32)
+                mean_acc += chunk_data.sum(axis=0, dtype=np.float64)
+                if save_std and sumsq_acc is not None:
+                    np.square(chunk_data, out=chunk_data)
+                    sumsq_acc += chunk_data.sum(axis=0, dtype=np.float64)
+                del chunk_data
+
+            mean_acc /= max(t, 1)
+            if save_mean:
+                tifffile.imwrite(
+                    mean_out_path,
+                    mean_acc.astype(np.float32),
+                    photometric="minisblack",
+                )
+            if save_std and sumsq_acc is not None:
+                var_map = np.maximum(
+                    sumsq_acc / max(t, 1) - np.square(mean_acc),
+                    0.0,
+                )
+                np.sqrt(var_map, out=var_map)
+                tifffile.imwrite(
+                    std_out_path,
+                    var_map.astype(np.float32),
+                    photometric="minisblack",
+                )
+            return
+
+        # Low-memory fallback: smaller row blocks, but slower because it
+        # revisits the movie once per spatial block.
+        target_chunk_bytes = 64 * 1024 * 1024
+        bytes_per_row = max(1, chunk * w * float32_bytes)
+        row_block = max(1, min(h, target_chunk_bytes // bytes_per_row))
+
+        if save_mean and mean_out_path.exists():
+            mean_out_path.unlink()
+        if save_std and std_out_path.exists():
+            std_out_path.unlink()
+
+        mean_map = (
+            tifffile.memmap(
+                mean_out_path,
+                shape=(h, w),
+                dtype=np.float32,
+                photometric="minisblack",
+            )
+            if save_mean
+            else None
+        )
+        std_map = (
+            tifffile.memmap(
+                std_out_path,
+                shape=(h, w),
+                dtype=np.float32,
+                photometric="minisblack",
+            )
+            if save_std
+            else None
+        )
+
+        total_blocks = (h + row_block - 1) // row_block
+        for y0 in tqdm.tqdm(
+            range(0, h, row_block),
+            total=total_blocks,
+            desc=f"save({stats_label},row)",
+            unit="block",
+            dynamic_ncols=True,
+        ):
+            y1 = min(y0 + row_block, h)
+            block_sum = np.zeros((y1 - y0, w), dtype=np.float64)
+            block_sumsq = (
+                np.zeros((y1 - y0, w), dtype=np.float64)
+                if save_std
+                else None
+            )
+
+            for start in range(0, t, chunk):
+                end = min(start + chunk, t)
+                chunk_data = np.asarray(video[start:end, y0:y1, :], dtype=np.float32)
+                block_sum += chunk_data.sum(axis=0, dtype=np.float64)
+                if save_std and block_sumsq is not None:
+                    np.square(chunk_data, out=chunk_data)
+                    block_sumsq += chunk_data.sum(axis=0, dtype=np.float64)
+                del chunk_data
+
+            block_mean = block_sum / max(t, 1)
+            if save_mean and mean_map is not None:
+                mean_map[y0:y1, :] = block_mean.astype(np.float32, copy=False)
+            if save_std and std_map is not None and block_sumsq is not None:
+                block_var = np.maximum(
+                    block_sumsq / max(t, 1) - np.square(block_mean),
+                    0.0,
+                )
+                np.sqrt(block_var, out=block_var)
+                std_map[y0:y1, :] = block_var.astype(np.float32, copy=False)
+
+        if mean_map is not None:
+            mean_map.flush()
+        if std_map is not None:
+            std_map.flush()
+
+
 def _is_complete_file(path: Path) -> bool:
     try:
         return path.is_file() and path.stat().st_size > 0
@@ -801,18 +1104,47 @@ def _is_complete_file(path: Path) -> bool:
         return False
 
 
-def _model_output_paths(save_dir: Path, factor: int) -> list[Path]:
+def _model_output_path_map(save_dir: Path, factor: int) -> dict[str, Path]:
     bf_name = "Bf.tif" if factor == 1 else f"Bf-d{factor}.tif"
     b_name = "B.tif" if factor == 1 else f"B-d{factor}.tif"
     ac_name = "AC.tif" if factor == 1 else f"AC-d{factor}.tif"
-    return [
-        save_dir / "Bc.tif",
-        save_dir / "Asum.tif",
-        save_dir / "ACsum.tif",
-        save_dir / bf_name,
-        save_dir / b_name,
-        save_dir / ac_name,
-    ]
+    return {
+        "Bc": save_dir / "Bc.tif",
+        "Asum": save_dir / "Asum.tif",
+        "ACsum": save_dir / "ACsum.tif",
+        "Bf": save_dir / bf_name,
+        "B": save_dir / b_name,
+        "AC": save_dir / ac_name,
+    }
+
+
+def _model_output_paths(save_dir: Path, factor: int) -> list[Path]:
+    return list(_model_output_path_map(save_dir, factor).values())
+
+
+def _get_missing_model_outputs(
+    save_dir: Path,
+    factor: int,
+    requested_output_names: Sequence[str] | None = None,
+) -> dict[str, Path]:
+    output_paths = _model_output_path_map(save_dir, factor)
+    requested_names = (
+        MODEL_OUTPUT_ORDER
+        if requested_output_names is None
+        else tuple(requested_output_names)
+    )
+    unknown_outputs = [name for name in requested_names if name not in output_paths]
+    if unknown_outputs:
+        raise ValueError(f"Unknown model outputs requested: {unknown_outputs}")
+    return {
+        name: output_paths[name]
+        for name in requested_names
+        if not _is_complete_file(output_paths[name])
+    }
+
+
+def _format_model_bar_desc(name: str, direction: str) -> str:
+    return f"save({name.rjust(MODEL_BAR_LABEL_WIDTH)}{direction}temp)"
 
 
 def normalize_downsample_factors(raw: object) -> list[int]:
@@ -832,8 +1164,8 @@ def normalize_downsample_factors(raw: object) -> list[int]:
     unique: list[int] = []
     seen: set[int] = set()
     for f in factors:
-        if f <= 0:
-            raise ValueError(f"downsample_factor values must be > 0, got {f}")
+        if f < 2:
+            raise ValueError(f"downsample_factor values must be >= 2, got {f}")
         if f in seen:
             continue
         seen.add(f)
@@ -862,9 +1194,10 @@ def run(
     x_base = input_path.with_suffix("").name
     y_base = y_input_path.with_suffix("").name
     downsample_factors = normalize_downsample_factors(downsample_factor)
-    save_path_first_frame_x = plot_dir / f"{x_base}-f0.tif"
-    save_path_first_frame_y = plot_dir / f"{y_base}-f0.tif"
-    save_path_mean_y = plot_dir / f"{y_base}sum.tif"
+    save_path_mean_x = plot_dir / f"{x_base}mean.tif"
+    save_path_std_x = plot_dir / f"{x_base}std.tif"
+    save_path_mean_y = plot_dir / f"{y_base}mean.tif"
+    save_path_std_y = plot_dir / f"{y_base}std.tif"
 
     plot_dir.mkdir(parents=True, exist_ok=True)
     resolved_model_load_fold = (
@@ -874,63 +1207,85 @@ def run(
     )
     should_save_model_products = resolved_model_load_fold.is_dir()
 
-    if not _is_complete_file(save_path_first_frame_x):
-        first_frame_x = read_first_frame(input_path)
-        tifffile.imwrite(save_path_first_frame_x, first_frame_x)
-
-    if not _is_complete_file(save_path_first_frame_y):
-        first_frame_y = read_first_frame(y_input_path)
-        tifffile.imwrite(save_path_first_frame_y, first_frame_y)
-
-    if not _is_complete_file(save_path_mean_y):
-        save_time_mean_tif(
-            x_path=y_input_path,
-            out_path=save_path_mean_y,
+    if (
+        not _is_complete_file(save_path_mean_x)
+        or not _is_complete_file(save_path_std_x)
+    ):
+        need_mean_x = not _is_complete_file(save_path_mean_x)
+        need_std_x = not _is_complete_file(save_path_std_x)
+        save_time_mean_std_tif(
+            x_path=input_path,
+            mean_out_path=save_path_mean_x,
+            std_out_path=save_path_std_x,
             chunk_size=int(chunk_size),
+            save_mean=need_mean_x,
+            save_std=need_std_x,
+        )
+
+    if (
+        not _is_complete_file(save_path_mean_y)
+        or not _is_complete_file(save_path_std_y)
+    ):
+        need_mean_y = not _is_complete_file(save_path_mean_y)
+        need_std_y = not _is_complete_file(save_path_std_y)
+        save_time_mean_std_tif(
+            x_path=y_input_path,
+            mean_out_path=save_path_mean_y,
+            std_out_path=save_path_std_y,
+            chunk_size=int(chunk_size),
+            save_mean=need_mean_y,
+            save_std=need_std_y,
         )
 
     core_specs: dict[str, tuple[int, int, int, int]] | None = None
     for factor in downsample_factors:
-        if factor > 1:
-            save_path_downsample_x = plot_dir / f"{x_base}-d{factor}.tif"
-            save_path_downsample_y = plot_dir / f"{y_base}-d{factor}.tif"
-            if not _is_complete_file(save_path_downsample_x):
-                save_downsampled_tif(
-                    x_path=input_path,
-                    out_path=save_path_downsample_x,
-                    downsample_factor=factor,
-                    chunk_size=int(chunk_size),
-                )
-            if not _is_complete_file(save_path_downsample_y):
-                save_downsampled_tif(
-                    x_path=y_input_path,
-                    out_path=save_path_downsample_y,
-                    downsample_factor=factor,
-                    chunk_size=int(chunk_size),
-                )
+        save_path_downsample_x = plot_dir / f"{x_base}-d{factor}.tif"
+        save_path_downsample_y = plot_dir / f"{y_base}-d{factor}.tif"
+        if not _is_complete_file(save_path_downsample_x):
+            save_downsampled_tif(
+                x_path=input_path,
+                out_path=save_path_downsample_x,
+                downsample_factor=factor,
+                chunk_size=int(chunk_size),
+            )
+        if not _is_complete_file(save_path_downsample_y):
+            save_downsampled_tif(
+                x_path=y_input_path,
+                out_path=save_path_downsample_y,
+                downsample_factor=factor,
+                chunk_size=int(chunk_size),
+            )
 
-        if should_save_model_products:
-            model_outputs = _model_output_paths(plot_dir, int(factor))
-            if not all(_is_complete_file(path) for path in model_outputs):
-                if para_load_path is None:
-                    raise ValueError("save requires para_load_path pointing to crop para.json.")
-                if core_specs is None:
-                    crop_params = load_crop_params(Path(para_load_path))
-                    patch_specs = crop_params["patch_specs"]
-                    core_specs = {
-                        spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
-                        for spec in patch_specs
-                    }
-                save_model_products_stitched(
-                    y_load_path=y_input_path,
-                    model_load_fold_cfg=str(resolved_model_load_fold),
-                    core_specs=core_specs,
-                    save_dir=plot_dir,
-                    downsample_factor=factor,
-                    chunk_size=int(chunk_size),
-                    model_workers=model_workers,
-                    model_memory_fraction=float(model_memory_fraction),
-                )
+    if should_save_model_products:
+        for factor in downsample_factors:
+            factor_int = int(factor)
+            missing_outputs = _get_missing_model_outputs(
+                save_dir=plot_dir,
+                factor=factor_int,
+                requested_output_names=MODEL_OUTPUT_ORDER,
+            )
+            if not missing_outputs:
+                continue
+            if para_load_path is None:
+                raise ValueError("save requires para_load_path pointing to crop para.json.")
+            if core_specs is None:
+                crop_params = load_crop_params(Path(para_load_path))
+                patch_specs = crop_params["patch_specs"]
+                core_specs = {
+                    spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
+                    for spec in patch_specs
+                }
+            save_model_products_stitched(
+                y_load_path=y_input_path,
+                model_load_fold_cfg=str(resolved_model_load_fold),
+                core_specs=core_specs,
+                save_dir=plot_dir,
+                downsample_factor=factor_int,
+                chunk_size=int(chunk_size),
+                model_workers=model_workers,
+                model_memory_fraction=float(model_memory_fraction),
+                requested_output_names=MODEL_OUTPUT_ORDER,
+            )
 
 
 class Save:

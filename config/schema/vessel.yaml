@@ -1,13 +1,11 @@
 vessel:
   y_load_path: ???
-  y_save_path: ???
   result_save_fold: ???
   chunk_size: 32
-  dtype: float32
-  frangi_sigmas: [6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0]
+  frangi_sigmas: [4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0]
   frangi_black_ridges: true
   mask_percentile: 80.0
-  min_object_area: 1000
+  min_object_area: 500
   mask_close_radius: 4
-  mask_dilation_radius: 1
+  mask_dilation_radius: 0
   input_percentiles: [1.0, 99.7]

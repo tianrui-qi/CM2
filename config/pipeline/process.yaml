@@ -8,32 +8,26 @@ defaults:
   - /schema/extract@_here_
   - _self_
 
+enable: true
 x_path: ???
 y_path: null              # default: [parent of x_load_path]/Y.tif
 chunk_size: 32
 
 stitch:
-  enable: true
+  enable: ${enable}
   x_load_path: ${x_path}
   y_save_path: ${y_path}
   result_save_fold: null  # default: [parent of y_save_path]/stitch/
   chunk_size: ${chunk_size}
 
 normalize:
-  enable: true
+  enable: ${enable}
   y_load_path: ${y_path}
   y_save_path: ${y_path}
-  chunk_size: ${chunk_size}
-
-vessel:
-  enable: true
-  y_load_path: ${y_path}
-  y_save_path: ${y_path}
-  result_save_fold: null  # default: [parent of y_save_path]/vessel/
   chunk_size: ${chunk_size}
 
 crop:
-  enable: true
+  enable: ${enable}
   x_load_path: ${x_path}
   y_load_path: ${y_path}
   para_load_path: null    # default: [parent of y_save_fold]/stitch/para.json
@@ -42,6 +36,12 @@ crop:
   chunk_size: ${chunk_size}
 
 extract:
-  enable: true
+  enable: ${enable}
   y_load_fold: ${crop.y_save_fold}
   model_save_fold: null   # default: [parent of y_load_fold]/extract/
+
+vessel:
+  enable: ${enable}
+  y_load_path: ${y_path}
+  result_save_fold: null  # default: [parent of y_load_path]/vessel/
+  chunk_size: ${chunk_size}
