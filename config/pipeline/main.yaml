@@ -3,21 +3,21 @@
 defaults:
   - /schema/stitch@_here_
   - /schema/normalize@_here_
-  - /schema/vessel@_here_
   - /schema/crop@_here_
   - /schema/extract@_here_
+  - /schema/save@_here_
   - _self_
 
 enable: true
 x_path: ???
-y_path: null              # default: [parent of x_load_path]/Y.tif
-chunk_size: 32
+y_path: null              # default: dirname(x_load_path)/Y.tif
+chunk_size: 16
 
 stitch:
   enable: ${enable}
   x_load_path: ${x_path}
   y_save_path: ${y_path}
-  result_save_fold: null  # default: [parent of y_save_path]/stitch/
+  stitch_save_fold: null  # default: dirname(y_save_path)/stitch/
   chunk_size: ${chunk_size}
 
 normalize:
@@ -30,18 +30,20 @@ crop:
   enable: ${enable}
   x_load_path: ${x_path}
   y_load_path: ${y_path}
-  para_load_path: null    # default: [parent of y_save_fold]/stitch/para.json
-  y_save_fold: null       # default: y_load_path without suffix
-  result_save_fold: null  # default: [parent of y_save_path]/crop/
+  stitch_load_fold: ${stitch.stitch_save_fold}
+  y_save_fold: null       # default: stem(y_load_path)
+  crop_save_fold: null    # default: dirname(y_save_path)/crop/
   chunk_size: ${chunk_size}
 
 extract:
   enable: ${enable}
   y_load_fold: ${crop.y_save_fold}
-  model_save_fold: null   # default: [parent of y_load_fold]/extract/
+  extract_save_fold: null # default: dirname(y_load_fold)/extract/
 
-vessel:
+save:
   enable: ${enable}
+  x_load_path: ${x_path}
   y_load_path: ${y_path}
-  result_save_fold: null  # default: [parent of y_load_path]/vessel/
-  chunk_size: ${chunk_size}
+  crop_load_path: ${crop.crop_save_fold}
+  extract_load_fold: ${extract.extract_save_fold}
+  save_fold: null         # default: dirname(y_load_fold)

@@ -1,7 +1,7 @@
 stitch:
   x_load_path: ???
   y_save_path: ???
-  result_save_fold: ???
+  stitch_save_fold: ???
   frame: [0, -1]
   chunk_size: 32
   mode: [frangi, frangi, raw]  # order: [L, R, LR]; choices: raw, frangi

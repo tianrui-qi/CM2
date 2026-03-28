@@ -1,13 +1,12 @@
+import csv
+import json
 from dataclasses import dataclass
 from collections.abc import Sequence
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from contextlib import ExitStack
 import logging
 import os
 import re
 import shutil
-import tempfile
 
 import numpy as np
 import tifffile
@@ -20,9 +19,17 @@ from .crop import (
 
 
 PATCH_NAME_RE = re.compile(r"^(\d+)-(\d+)-(\d+)-(\d+)$")
-MODEL_STATIC_OUTPUT_ORDER = ("ACsum", "Asum", "Bc")
-MODEL_VIDEO_OUTPUT_ORDER = ("AC", "Bf", "B")
-MODEL_OUTPUT_ORDER = MODEL_STATIC_OUTPUT_ORDER + MODEL_VIDEO_OUTPUT_ORDER
+MODEL_STATIC_OUTPUT_ORDER = ("Bc", "ACsum", "ACYrAsum")
+MODEL_VIDEO_OUTPUT_ORDER = ("AC", "ACYrA", "Bf", "B")
+MODEL_QC_STATIC_OUTPUT_ORDER = ("ACsum-qc", "ACYrAsum-qc")
+MODEL_QC_VIDEO_OUTPUT_ORDER = ("AC-qc", "ACYrA-qc")
+MODEL_2D_OUTPUT_ORDER = MODEL_STATIC_OUTPUT_ORDER + MODEL_QC_STATIC_OUTPUT_ORDER
+MODEL_3D_OUTPUT_ORDER = MODEL_VIDEO_OUTPUT_ORDER + MODEL_QC_VIDEO_OUTPUT_ORDER
+MODEL_OUTPUT_ORDER = (
+    MODEL_2D_OUTPUT_ORDER
+    + MODEL_3D_OUTPUT_ORDER
+)
+LEGACY_TEMP_OUTPUT_DIRS = ("A", "C", "YrA", "W", "Bc") + MODEL_OUTPUT_ORDER
 MODEL_BAR_LABEL_WIDTH = 5
 
 
@@ -48,12 +55,16 @@ class PatchMeta:
     core_ly1: int = 0
     core_lx0: int = 0
     core_lx1: int = 0
-    ds_ly0: int = 0
-    ds_lx0: int = 0
-    ds_y0: int = 0
-    ds_y1: int = 0
-    ds_x0: int = 0
-    ds_x1: int = 0
+
+
+@dataclass(frozen=True)
+class QcThresholdSpec:
+    key: str
+    scale: str
+    mean: float
+    std: float
+    lower_z: float | None
+    upper_z: float | None
 
 
 def _parse_patch_name(stem: str) -> tuple[int, int, int, int]:
@@ -76,7 +87,7 @@ def _model_file_to_patch_name(path: Path) -> str:
 
 def _resolve_patch_folders(
     y_load_path: Path,
-    model_load_fold_cfg: str | None,
+    extract_load_fold_cfg: str | None,
 ) -> tuple[Path, Path]:
     y_load_fold = y_load_path.with_suffix("")
     if not y_load_fold.is_dir():
@@ -88,26 +99,29 @@ def _resolve_patch_folders(
                 f"Patch movie folder not found. Tried: {y_load_fold} and {fallback}"
             )
 
-    model_load_fold = (
-        y_load_path.parent / "model"
-        if model_load_fold_cfg is None
-        else Path(model_load_fold_cfg)
+    extract_load_fold = (
+        y_load_path.parent / "extract"
+        if extract_load_fold_cfg is None
+        else Path(extract_load_fold_cfg)
     )
-    if not model_load_fold.is_dir():
+    if not extract_load_fold.is_dir():
         raise NotADirectoryError(
-            f"model_load_fold must be an existing directory: {model_load_fold}"
+            f"extract_load_fold must be an existing directory: {extract_load_fold}"
         )
-    return y_load_fold, model_load_fold
+    model_dir = extract_load_fold / "model"
+    if model_dir.is_dir():
+        return y_load_fold, model_dir
+    return y_load_fold, extract_load_fold
 
 
 def _collect_patch_meta(
     y_load_fold: Path,
-    model_load_fold: Path,
+    extract_load_fold: Path,
 ) -> list[PatchMeta]:
     patches: list[PatchMeta] = []
-    model_files = sorted(model_load_fold.glob("*.hdf5"), key=lambda p: p.name)
+    model_files = sorted(extract_load_fold.glob("*.hdf5"), key=lambda p: p.name)
     if not model_files:
-        raise FileNotFoundError(f"No .hdf5 model files found in: {model_load_fold}")
+        raise FileNotFoundError(f"No .hdf5 model files found in: {extract_load_fold}")
 
     for model_path in model_files:
         patch_name = _model_file_to_patch_name(model_path)
@@ -141,6 +155,148 @@ def _collect_patch_meta(
             )
         )
     return patches
+
+
+def _resolve_extract_root(model_dir_or_root: Path) -> Path:
+    if model_dir_or_root.name == "model":
+        return model_dir_or_root.parent
+    return model_dir_or_root
+
+
+def _metric_to_qc_space(
+    raw_value: float,
+    scale: str,
+) -> float:
+    value = float(raw_value)
+    if scale == "linear":
+        return value
+    if scale == "log":
+        if np.isfinite(value) and value > 0.0:
+            return float(np.log10(value))
+        return float("-inf")
+    raise ValueError(f"Unsupported QC metric scale: {scale}")
+
+
+def _normalize_qc_bounds(
+    bounds: Sequence[float | None] | None,
+    key: str,
+) -> tuple[float | None, float | None]:
+    if bounds is None:
+        return None, None
+    if isinstance(bounds, (str, bytes)):
+        raise TypeError(
+            f"QC threshold for {key} must be [lower, upper] or null, got string-like value."
+        )
+    bounds_list = list(bounds)
+    if len(bounds_list) != 2:
+        raise ValueError(
+            f"QC threshold for {key} must have exactly two entries: [lower, upper]."
+        )
+
+    def _cast_one(value: float | None) -> float | None:
+        if value is None:
+            return None
+        return float(value)
+
+    return _cast_one(bounds_list[0]), _cast_one(bounds_list[1])
+
+
+def _load_qc_threshold_specs(
+    extract_root: Path,
+    t_snr: Sequence[float | None] | None,
+    t_r_value: Sequence[float | None] | None,
+    t_lam: Sequence[float | None] | None,
+    t_neurons_sn: Sequence[float | None] | None,
+) -> tuple[QcThresholdSpec, ...]:
+    requested: dict[str, tuple[float | None, float | None]] = {
+        "snr": _normalize_qc_bounds(t_snr, "snr"),
+        "r_value": _normalize_qc_bounds(t_r_value, "r_value"),
+        "lam": _normalize_qc_bounds(t_lam, "lam"),
+        "neurons_sn": _normalize_qc_bounds(t_neurons_sn, "neurons_sn"),
+    }
+    enabled = {
+        key: value
+        for key, value in requested.items()
+        if value[0] is not None or value[1] is not None
+    }
+    if not enabled:
+        return ()
+
+    stats_path = extract_root / "stats.json"
+    if not stats_path.is_file():
+        raise FileNotFoundError(
+            f"QC thresholds require extract stats.json, but it was not found: {stats_path}"
+        )
+    payload = json.loads(stats_path.read_text(encoding="utf-8"))
+
+    specs: list[QcThresholdSpec] = []
+    for key, (lower_z, upper_z) in enabled.items():
+        raw_stats = payload.get(key)
+        if not isinstance(raw_stats, dict):
+            raise KeyError(f"Missing QC metric stats for {key}: {stats_path}")
+        scale = str(raw_stats["scale"])
+        mean = float(raw_stats["mean"])
+        std = float(raw_stats["std"])
+        if not np.isfinite(std) or std <= 0.0:
+            raise ValueError(
+                f"Invalid std for QC metric {key} in {stats_path}: {std}"
+            )
+        specs.append(
+            QcThresholdSpec(
+                key=key,
+                scale=scale,
+                mean=mean,
+                std=std,
+                lower_z=lower_z,
+                upper_z=upper_z,
+            )
+        )
+    return tuple(specs)
+
+
+def _read_patch_qc_keep_mask(
+    profile_path: Path,
+    n_components: int,
+    qc_threshold_specs: Sequence[QcThresholdSpec],
+) -> np.ndarray:
+    if not profile_path.is_file():
+        raise FileNotFoundError(f"Missing profile CSV for QC save: {profile_path}")
+
+    if not qc_threshold_specs:
+        return np.ones(n_components, dtype=bool)
+
+    keep = np.ones(n_components, dtype=bool)
+    seen = 0
+    with profile_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            component_index = int(row["component_index"])
+            if component_index < 0 or component_index >= n_components:
+                raise ValueError(
+                    f"component_index out of range in {profile_path}: "
+                    f"{component_index} vs n_components={n_components}"
+                )
+            keep_value = True
+            for spec in qc_threshold_specs:
+                metric_space_value = _metric_to_qc_space(
+                    raw_value=float(row[spec.key]),
+                    scale=spec.scale,
+                )
+                z_value = (metric_space_value - spec.mean) / spec.std
+                if spec.lower_z is not None and z_value < spec.lower_z:
+                    keep_value = False
+                    break
+                if spec.upper_z is not None and z_value > spec.upper_z:
+                    keep_value = False
+                    break
+            keep[component_index] = keep_value
+            seen += 1
+    if seen != n_components:
+        raise ValueError(
+            f"Profile/model component mismatch for {profile_path}: "
+            f"csv_rows={seen}, n_components={n_components}"
+        )
+    return keep
 
 
 def _compute_patch_layout(
@@ -239,19 +395,6 @@ def _compute_patch_layout(
     return full_h, full_w, placements
 
 
-def _prepare_patch_downsample_slices(p: PatchMeta, factor: int) -> None:
-    off_y = (-p.y0) % factor
-    off_x = (-p.x0) % factor
-    p.ds_ly0 = p.core_ly0 + off_y
-    p.ds_lx0 = p.core_lx0 + off_x
-    p.ds_y0 = (p.y0 + off_y) // factor
-    p.ds_x0 = (p.x0 + off_x) // factor
-    h_ds = (p.core_h - off_y + factor - 1) // factor
-    w_ds = (p.core_w - off_x + factor - 1) // factor
-    p.ds_y1 = p.ds_y0 + h_ds
-    p.ds_x1 = p.ds_x0 + w_ds
-
-
 def _get_available_memory_bytes() -> int | None:
     try:
         import psutil  # type: ignore
@@ -300,90 +443,140 @@ def _get_available_memory_bytes() -> int | None:
     return None
 
 
-def _estimate_worker_memory_bytes(
+def _create_output_memmap(
+    path: Path,
+    shape: tuple[int, ...],
+    zero_init: bool,
+) -> np.memmap:
+    if path.exists():
+        path.unlink()
+    array = tifffile.memmap(
+        path,
+        shape=shape,
+        dtype=np.float32,
+        photometric="minisblack",
+        bigtiff=(int(np.prod(shape, dtype=np.int64)) * np.dtype(np.float32).itemsize) >= (2**31),
+    )
+    if zero_init:
+        array[...] = 0.0
+    return array
+
+
+def _grid_has_holes(
     patches: list[PatchMeta],
-    model_chunk: int,
-) -> int:
-    if not patches:
-        return 1 << 30
-    float_bytes = np.dtype(np.float32).itemsize
-    max_pixels = max(p.h * p.w for p in patches)
-    max_model_bytes = max(int(p.model_path.stat().st_size) for p in patches)
-    dense_work = max_pixels * model_chunk * float_bytes * 6
-    frame_buffers = max_pixels * float_bytes * 6
-    model_overhead = int(max_model_bytes * 5 // 2)
-    fixed_overhead = 512 * 1024 * 1024
-    estimate = dense_work + frame_buffers + model_overhead + fixed_overhead
-    return max(256 * 1024 * 1024, estimate)
+    full_h: int,
+    full_w: int,
+) -> bool:
+    covered = np.zeros((full_h, full_w), dtype=bool)
+    for p in patches:
+        covered[p.y0 : p.y1, p.x0 : p.x1] = True
+    return not bool(np.all(covered))
 
 
-def _resolve_parallel_workers(
-    patches: list[PatchMeta],
-    model_chunk: int,
-    requested_workers: int | None,
-    memory_usage_fraction: float,
-) -> int:
-    if not patches:
-        return 1
-    cpu_total = max(1, os.cpu_count() or 1)
-    cpu_cap = max(1, cpu_total - 1)
-
-    if requested_workers is not None:
-        req = int(requested_workers)
-        if req <= 0:
-            raise ValueError(f"model_workers must be > 0 when set, got {req}")
-        target = min(req, cpu_cap)
-    else:
-        target = cpu_cap
-
-    frac = float(memory_usage_fraction)
-    if not (0.1 <= frac <= 0.95):
-        raise ValueError(
-            f"model_memory_fraction must be in [0.1, 0.95], got {memory_usage_fraction}"
-        )
-
-    avail_bytes = _get_available_memory_bytes()
-    memory_cap = len(patches)
-    if avail_bytes is not None:
-        worker_mem = _estimate_worker_memory_bytes(patches, model_chunk)
-        budget = int(avail_bytes * frac)
-        if budget <= 0:
-            memory_cap = 1
-        else:
-            memory_cap = max(1, budget // max(worker_mem, 1))
-
-    workers = min(len(patches), target, memory_cap)
-    return max(1, workers)
-
-
-def _process_single_patch_to_temp(
+def _choose_model_chunk(
     p: PatchMeta,
-    tmp_dir: Path,
-    factor: int,
+    global_t: int,
+    need_ac: bool,
+    need_acyra: bool,
+    need_background: bool,
+) -> int:
+    if global_t <= 0:
+        return 1
+
+    pixel_count = max(1, p.h * p.w)
+    bytes_per_frame = pixel_count * np.dtype(np.float32).itemsize
+
+    available_memory = _get_available_memory_bytes()
+    if available_memory is None:
+        scratch_budget = 512 * 1024 * 1024
+        available_memory = scratch_budget
+
+    reserve_bytes = max(1024**3, int(available_memory * 0.12))
+    working_budget = available_memory - reserve_bytes
+    if working_budget <= 0:
+        return 1
+
+    live_array_count = 0.0
+    if need_ac or need_background:
+        live_array_count += 1.0  # AC matrix
+    if need_acyra:
+        live_array_count += 1.0  # ACYrA matrix
+    if need_background:
+        live_array_count += 3.0  # movie block, residual, Bf
+    if live_array_count <= 0:
+        return global_t
+
+    # Keep a cushion for sparse matmul internals, reshapes/views, and Python overhead
+    live_array_count *= 1.25
+    max_frames = int(working_budget // max(1.0, bytes_per_frame * live_array_count))
+    if max_frames <= 0:
+        return 1
+    return max(1, min(global_t, max_frames))
+
+
+def _choose_stats_chunk(
+    t: int,
+    h: int,
+    w: int,
+    save_std: bool,
+) -> tuple[int, bool]:
+    if t <= 0:
+        return 1, True
+
+    pixel_count = max(1, h * w)
+    float32_bytes = np.dtype(np.float32).itemsize
+    float64_bytes = np.dtype(np.float64).itemsize
+    accumulator_bytes = pixel_count * float64_bytes * (1 + int(save_std))
+    mean_work_bytes = pixel_count * float64_bytes
+    per_frame_scratch_bytes = pixel_count * float32_bytes
+
+    available_memory = _get_available_memory_bytes()
+    if available_memory is None:
+        scratch_budget = 256 * 1024 * 1024
+        max_chunk = max(1, scratch_budget // max(1, per_frame_scratch_bytes))
+        return max(1, min(t, max_chunk)), True
+
+    reserve_bytes = max(1024**3, int(available_memory * 0.12))
+    working_budget = available_memory - reserve_bytes - accumulator_bytes - mean_work_bytes
+    if working_budget < per_frame_scratch_bytes:
+        fallback_chunk = max(1, min(t, 8))
+        return fallback_chunk, False
+
+    max_chunk = max(1, int(working_budget // max(1, per_frame_scratch_bytes)))
+    return max(1, min(t, max_chunk)), True
+
+
+def _process_single_patch_into_outputs(
+    p: PatchMeta,
+    global_t: int,
     model_chunk: int,
-    bf_name: str,
-    b_name: str,
-    ac_name: str,
-    save_bc: bool,
-    save_asum: bool,
-    save_acsum: bool,
-    save_bf: bool,
-    save_b: bool,
-    save_ac: bool,
-) -> tuple[str, int]:
+    static_outputs: dict[str, np.memmap],
+    video_outputs: dict[str, np.memmap],
+    profile_dir: Path | None,
+    qc_threshold_specs: Sequence[QcThresholdSpec],
+) -> None:
     from caiman.source_extraction.cnmf.cnmf import load_CNMF
 
     logging.getLogger("caiman").setLevel(logging.ERROR)
-    patch_dir = tmp_dir / p.patch_name
-    patch_dir.mkdir(parents=True, exist_ok=True)
-    need_video = bool(save_bf or save_b or save_ac)
-
     cnm = load_CNMF(str(p.model_path), n_processes=1, dview=None)
     dims = tuple(int(x) for x in list(cnm.dims)[:2])
     if dims != (p.h, p.w):
         raise ValueError(
             f"Movie/model dims mismatch for {p.patch_name}: movie={(p.h, p.w)}, model={dims}"
         )
+
+    need_bc = ("Bc" in static_outputs) or ("Bf" in video_outputs) or ("B" in video_outputs)
+    need_acyra = (
+        ("ACYrAsum" in static_outputs)
+        or ("ACYrA" in video_outputs)
+        or ("ACYrAsum-qc" in static_outputs)
+        or ("ACYrA-qc" in video_outputs)
+    )
+    need_background = ("Bf" in video_outputs) or ("B" in video_outputs)
+    need_video = bool(video_outputs)
+    need_qc = any(name.endswith("-qc") for name in static_outputs) or any(
+        name.endswith("-qc") for name in video_outputs
+    )
 
     A = cnm.estimates.A.tocsr()
     C = np.asarray(cnm.estimates.C, dtype=np.float32)
@@ -393,246 +586,241 @@ def _process_single_patch_to_temp(
         raise ValueError(
             f"A/C shape mismatch for {p.patch_name}: A={A.shape}, C={C.shape}"
         )
-
-    b0_raw = getattr(cnm.estimates, "b0", None)
-    if b0_raw is None:
-        raise ValueError(f"Model has no b0 for {p.patch_name}: {p.model_path}")
-    b0 = np.asarray(b0_raw, dtype=np.float32).reshape(-1)
-    if b0.size != p.h * p.w:
+    if C.shape[1] < global_t:
         raise ValueError(
-            f"b0 size mismatch for {p.patch_name}: {b0.size} vs {p.h * p.w}"
+            f"C shorter than required global_t for {p.patch_name}: {C.shape[1]} < {global_t}"
         )
 
-    W = getattr(cnm.estimates, "W", None) if (save_bf or save_b) else None
-    if (save_bf or save_b) and W is None:
-        raise ValueError(f"Model has no W for {p.patch_name}: {p.model_path}")
-
-    t_use = min(p.t, int(C.shape[1]))
-    if t_use <= 0:
-        raise ValueError(f"No valid frames for patch: {p.patch_name}")
-
-    need_bc_patch = bool(save_bc or save_b)
-    if save_bc or save_asum or save_acsum or need_bc_patch:
-        bc_patch = b0.reshape((p.h, p.w), order="F").astype(np.float32, copy=False)
-    else:
-        bc_patch = None
-
-    if save_asum:
-        asum_patch = np.asarray(A.sum(axis=1), dtype=np.float32).reshape(-1)
-        asum_patch = asum_patch.reshape((p.h, p.w), order="F").astype(
-            np.float32, copy=False
+    keep_mask: np.ndarray | None = None
+    A_qc = None
+    C_qc: np.ndarray | None = None
+    if need_qc:
+        if profile_dir is None:
+            raise ValueError(f"QC outputs requested but no profile_dir resolved for {p.patch_name}")
+        profile_path = profile_dir / f"{p.patch_name}.tif.csv"
+        keep_mask = _read_patch_qc_keep_mask(
+            profile_path=profile_path,
+            n_components=C.shape[0],
+            qc_threshold_specs=qc_threshold_specs,
         )
-        asum_core = asum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-        tifffile.imwrite(
-            patch_dir / "Asum.tif",
-            asum_core,
-            imagej=True,
-            metadata={"axes": "YX"},
-        )
+        if np.any(keep_mask):
+            A_qc = A[:, keep_mask]
+            C_qc = C[keep_mask, :]
+        else:
+            C_qc = np.zeros((0, C.shape[1]), dtype=np.float32)
 
-    if save_acsum:
-        csum = C[:, :t_use].sum(axis=1, dtype=np.float32)
-        acsum_patch = np.asarray(A @ csum, dtype=np.float32).reshape(-1)
-        acsum_patch = acsum_patch.reshape((p.h, p.w), order="F").astype(
-            np.float32, copy=False
+    YrA: np.ndarray | None = None
+    YrA_qc: np.ndarray | None = None
+    if need_acyra:
+        YrA_raw = getattr(cnm.estimates, "YrA", None)
+        YrA = (
+            np.asarray(YrA_raw, dtype=np.float32)
+            if YrA_raw is not None
+            else np.zeros_like(C, dtype=np.float32)
         )
-        acsum_core = acsum_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-        tifffile.imwrite(
-            patch_dir / "ACsum.tif",
-            acsum_core,
-            imagej=True,
-            metadata={"axes": "YX"},
-        )
-
-    bc_down: np.ndarray | None = None
-    if bc_patch is not None:
-        if save_bc:
-            bc_core = bc_patch[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
-            tifffile.imwrite(
-                patch_dir / "Bc.tif",
-                bc_core,
-                imagej=True,
-                metadata={"axes": "YX"},
+        if YrA.shape != C.shape:
+            raise ValueError(
+                f"YrA/C shape mismatch for {p.patch_name}: YrA={YrA.shape}, C={C.shape}"
             )
-        if save_b:
-            bc_down = bc_patch[
-                p.ds_ly0 : p.core_ly1 : factor,
-                p.ds_lx0 : p.core_lx1 : factor,
-            ]
+        if YrA.shape[1] < global_t:
+            raise ValueError(
+                f"YrA shorter than required global_t for {p.patch_name}: {YrA.shape[1]} < {global_t}"
+            )
+        if need_qc:
+            if keep_mask is None:
+                raise RuntimeError(f"Missing keep_mask while preparing QC YrA for {p.patch_name}")
+            if np.any(keep_mask):
+                YrA_qc = YrA[keep_mask, :]
+            else:
+                YrA_qc = np.zeros((0, YrA.shape[1]), dtype=np.float32)
 
-    if need_video:
-        with tifffile.TiffFile(p.movie_path) as tif:
-            video = zarr.open(tif.aszarr(), mode="r")
-            if video.ndim != 3:
-                raise ValueError(
-                    f"Patch movie must be TYX, got ndim={video.ndim}: {p.movie_path}"
-                )
-            if int(video.shape[0]) < t_use:
-                raise ValueError(
-                    f"Patch movie shorter than expected for {p.patch_name}: {video.shape[0]} < {t_use}"
-                )
+    bc_patch: np.ndarray | None = None
+    bc_flat: np.ndarray | None = None
+    bc_core: np.ndarray | None = None
+    if need_bc:
+        b0_raw = getattr(cnm.estimates, "b0", None)
+        if b0_raw is None:
+            raise ValueError(f"Model has no b0 for {p.patch_name}: {p.model_path}")
+        b0 = np.asarray(b0_raw, dtype=np.float32).reshape(-1)
+        if b0.size != p.h * p.w:
+            raise ValueError(
+                f"b0 size mismatch for {p.patch_name}: {b0.size} vs {p.h * p.w}"
+            )
+        bc_patch = b0.reshape((p.h, p.w), order="F").astype(np.float32, copy=False)
+        bc_flat = bc_patch.reshape(-1, order="F")
+        bc_core = _crop_core_2d(p, bc_patch)
+        if "Bc" in static_outputs:
+            static_outputs["Bc"][p.y0 : p.y1, p.x0 : p.x1] = bc_core
 
-            with ExitStack() as stack:
-                writer_bf = (
-                    stack.enter_context(
-                        tifffile.TiffWriter(patch_dir / bf_name, bigtiff=True)
-                    )
-                    if save_bf
-                    else None
-                )
-                writer_b = (
-                    stack.enter_context(
-                        tifffile.TiffWriter(patch_dir / b_name, bigtiff=True)
-                    )
-                    if save_b
-                    else None
-                )
-                writer_ac = (
-                    stack.enter_context(
-                        tifffile.TiffWriter(patch_dir / ac_name, bigtiff=True)
-                    )
-                    if save_ac
-                    else None
-                )
+    if "ACsum" in static_outputs:
+        csum = C[:, :global_t].sum(axis=1, dtype=np.float32)
+        acsum_patch = np.asarray(A @ csum, dtype=np.float32).reshape((p.h, p.w), order="F")
+        static_outputs["ACsum"][p.y0 : p.y1, p.x0 : p.x1] = _crop_core_2d(p, acsum_patch)
 
-                for start in range(0, t_use, model_chunk):
-                    end = min(start + model_chunk, t_use)
-                    tc = end - start
-                    c_chunk = C[:, start:end]
-                    ac_mat = np.asarray(A @ c_chunk, dtype=np.float32)
+    if "ACsum-qc" in static_outputs:
+        if A_qc is None or C_qc is None:
+            acsum_qc_patch = np.zeros((p.h, p.w), dtype=np.float32)
+        else:
+            csum_qc = C_qc[:, :global_t].sum(axis=1, dtype=np.float32)
+            acsum_qc_patch = np.asarray(A_qc @ csum_qc, dtype=np.float32).reshape(
+                (p.h, p.w),
+                order="F",
+            )
+        static_outputs["ACsum-qc"][p.y0 : p.y1, p.x0 : p.x1] = _crop_core_2d(
+            p,
+            acsum_qc_patch,
+        )
+
+    if "ACYrAsum" in static_outputs:
+        if YrA is None:
+            raise RuntimeError(f"Missing YrA while writing ACYrAsum for {p.patch_name}")
+        acyra_sum = (C[:, :global_t] + YrA[:, :global_t]).sum(axis=1, dtype=np.float32)
+        acyrasum_patch = np.asarray(A @ acyra_sum, dtype=np.float32).reshape((p.h, p.w), order="F")
+        static_outputs["ACYrAsum"][p.y0 : p.y1, p.x0 : p.x1] = _crop_core_2d(p, acyrasum_patch)
+
+    if "ACYrAsum-qc" in static_outputs:
+        if A_qc is None or C_qc is None or YrA_qc is None:
+            acyrasum_qc_patch = np.zeros((p.h, p.w), dtype=np.float32)
+        else:
+            acyra_sum_qc = (C_qc[:, :global_t] + YrA_qc[:, :global_t]).sum(
+                axis=1,
+                dtype=np.float32,
+            )
+            acyrasum_qc_patch = np.asarray(A_qc @ acyra_sum_qc, dtype=np.float32).reshape(
+                (p.h, p.w),
+                order="F",
+            )
+        static_outputs["ACYrAsum-qc"][p.y0 : p.y1, p.x0 : p.x1] = _crop_core_2d(
+            p,
+            acyrasum_qc_patch,
+        )
+
+    if not need_video:
+        return
+
+    W = None
+    if need_background:
+        W = getattr(cnm.estimates, "W", None)
+        if W is None:
+            raise ValueError(f"Model has no W for {p.patch_name}: {p.model_path}")
+        W = W.tocsr()
+
+    with tifffile.TiffFile(p.movie_path) as tif:
+        video = zarr.open(tif.aszarr(), mode="r")
+        if video.ndim != 3:
+            raise ValueError(
+                f"Patch movie must be TYX, got ndim={video.ndim}: {p.movie_path}"
+            )
+        if int(video.shape[0]) < global_t:
+            raise ValueError(
+                f"Patch movie shorter than required global_t for {p.patch_name}: {video.shape[0]} < {global_t}"
+            )
+
+        for start in range(0, global_t, model_chunk):
+            end = min(start + model_chunk, global_t)
+            tc = end - start
+
+            ac_mat: np.ndarray | None = None
+            if ("AC" in video_outputs) or need_background:
+                c_chunk = C[:, start:end].astype(np.float32, copy=False)
+                ac_mat = np.asarray(A @ c_chunk, dtype=np.float32)
+                if "AC" in video_outputs:
                     ac_frames = ac_mat.T.reshape((tc, p.h, p.w), order="F")
-                    ac_down = ac_frames[
-                        :,
-                        p.ds_ly0 : p.core_ly1 : factor,
-                        p.ds_lx0 : p.core_lx1 : factor,
-                    ]
+                    video_outputs["AC"][
+                        start:end,
+                        p.y0 : p.y1,
+                        p.x0 : p.x1,
+                    ] = _crop_core_3d(p, ac_frames)
 
-                    if save_ac and writer_ac is not None:
-                        for i in range(tc):
-                            writer_ac.write(
-                                ac_down[i].astype(np.float32, copy=False),
-                                contiguous=True,
-                                photometric="minisblack",
-                            )
+            if "AC-qc" in video_outputs:
+                if A_qc is None or C_qc is None:
+                    ac_qc_frames = np.zeros((tc, p.h, p.w), dtype=np.float32)
+                else:
+                    c_qc_chunk = C_qc[:, start:end].astype(np.float32, copy=False)
+                    ac_qc_mat = np.asarray(A_qc @ c_qc_chunk, dtype=np.float32)
+                    ac_qc_frames = ac_qc_mat.T.reshape((tc, p.h, p.w), order="F")
+                video_outputs["AC-qc"][
+                    start:end,
+                    p.y0 : p.y1,
+                    p.x0 : p.x1,
+                ] = _crop_core_3d(p, ac_qc_frames)
 
-                    if save_bf or save_b:
-                        block = np.asarray(video[start:end], dtype=np.float32)
-                        y_mat = np.transpose(block, (1, 2, 0)).reshape(
-                            (p.h * p.w, tc), order="F"
-                        )
-                        residual = y_mat - ac_mat - b0[:, None]
-                        bf_mat = np.asarray(W @ residual, dtype=np.float32)
-                        bf_frames = bf_mat.T.reshape((tc, p.h, p.w), order="F")
-                        bf_down = bf_frames[
-                            :,
-                            p.ds_ly0 : p.core_ly1 : factor,
-                            p.ds_lx0 : p.core_lx1 : factor,
-                        ]
+            if "ACYrA" in video_outputs:
+                if YrA is None:
+                    raise RuntimeError(f"Missing YrA while writing ACYrA for {p.patch_name}")
+                acyra_chunk = C[:, start:end] + YrA[:, start:end]
+                acyra_mat = np.asarray(A @ acyra_chunk, dtype=np.float32)
+                acyra_frames = acyra_mat.T.reshape((tc, p.h, p.w), order="F")
+                video_outputs["ACYrA"][
+                    start:end,
+                    p.y0 : p.y1,
+                    p.x0 : p.x1,
+                ] = _crop_core_3d(p, acyra_frames)
 
-                        if save_bf and writer_bf is not None:
-                            for i in range(tc):
-                                writer_bf.write(
-                                    bf_down[i].astype(np.float32, copy=False),
-                                    contiguous=True,
-                                    photometric="minisblack",
-                                )
+            if "ACYrA-qc" in video_outputs:
+                if A_qc is None or C_qc is None or YrA_qc is None:
+                    acyra_qc_frames = np.zeros((tc, p.h, p.w), dtype=np.float32)
+                else:
+                    acyra_qc_chunk = C_qc[:, start:end] + YrA_qc[:, start:end]
+                    acyra_qc_mat = np.asarray(A_qc @ acyra_qc_chunk, dtype=np.float32)
+                    acyra_qc_frames = acyra_qc_mat.T.reshape((tc, p.h, p.w), order="F")
+                video_outputs["ACYrA-qc"][
+                    start:end,
+                    p.y0 : p.y1,
+                    p.x0 : p.x1,
+                ] = _crop_core_3d(p, acyra_qc_frames)
 
-                        if save_b and writer_b is not None:
-                            if bc_down is None:
-                                raise RuntimeError(
-                                    f"Missing bc_down while writing B for {p.patch_name}"
-                                )
-                            b_down = bf_down + bc_down[None, :, :]
-                            for i in range(tc):
-                                writer_b.write(
-                                    b_down[i].astype(np.float32, copy=False),
-                                    contiguous=True,
-                                    photometric="minisblack",
-                                )
-
-    return p.patch_name, int(t_use)
-
-
-def _stitch_video_from_temp(
-    patches: list[PatchMeta],
-    tmp_root: Path,
-    patch_video_name: str,
-    out_path: Path,
-    full_h_ds: int,
-    full_w_ds: int,
-    global_t: int,
-) -> None:
-    opened: list[tifffile.TiffFile] = []
-    arrays: list[zarr.Array] = []
-    try:
-        for p in patches:
-            patch_file = tmp_root / p.patch_name / patch_video_name
-            tf = tifffile.TiffFile(patch_file)
-            opened.append(tf)
-            arr = zarr.open(tf.aszarr(), mode="r")
-            if arr.ndim != 3:
-                raise ValueError(f"Expected TYX patch video, got ndim={arr.ndim}: {patch_file}")
-            if int(arr.shape[0]) < global_t:
-                raise ValueError(
-                    f"Patch video shorter than expected for {p.patch_name}: {arr.shape[0]} < {global_t}"
+            if need_background:
+                if ac_mat is None:
+                    raise RuntimeError(f"Missing AC while writing background for {p.patch_name}")
+                if W is None or bc_flat is None or bc_core is None:
+                    raise RuntimeError(f"Missing background inputs for {p.patch_name}")
+                block = np.asarray(video[start:end], dtype=np.float32)
+                y_mat = np.transpose(block, (1, 2, 0)).reshape(
+                    (p.h * p.w, tc),
+                    order="F",
                 )
-            arrays.append(arr)
-
-        with tifffile.TiffWriter(out_path, bigtiff=True) as writer:
-            for t in tqdm.tqdm(
-                range(global_t),
-                total=global_t,
-                desc=_format_model_bar_desc(out_path.stem, "<-"),
-                unit="frame",
-                dynamic_ncols=True,
-            ):
-                frame = np.zeros((full_h_ds, full_w_ds), dtype=np.float32)
-                for p, arr in zip(patches, arrays):
-                    patch_frame = np.asarray(arr[t], dtype=np.float32)
-                    frame[p.ds_y0 : p.ds_y1, p.ds_x0 : p.ds_x1] = patch_frame
-                writer.write(
-                    frame,
-                    contiguous=True,
-                    photometric="minisblack",
-                )
-    finally:
-        for tf in opened:
-            tf.close()
-
-
+                residual = y_mat - ac_mat - bc_flat[:, None]
+                bf_mat = np.asarray(W @ residual, dtype=np.float32)
+                bf_frames = bf_mat.T.reshape((tc, p.h, p.w), order="F")
+                bf_core = _crop_core_3d(p, bf_frames)
+                if "Bf" in video_outputs:
+                    video_outputs["Bf"][
+                        start:end,
+                        p.y0 : p.y1,
+                        p.x0 : p.x1,
+                    ] = bf_core
+                if "B" in video_outputs:
+                    video_outputs["B"][
+                        start:end,
+                        p.y0 : p.y1,
+                        p.x0 : p.x1,
+                    ] = bf_core + bc_core[None, :, :]
 def save_model_products_stitched(
     y_load_path: Path,
-    model_load_fold_cfg: str | None,
+    extract_load_fold_cfg: str | None,
     core_specs: dict[str, tuple[int, int, int, int]],
     save_dir: Path,
-    downsample_factor: int,
-    chunk_size: int,
-    model_workers: int | None,
-    model_memory_fraction: float,
+    t_snr: Sequence[float | None] | None,
+    t_r_value: Sequence[float | None] | None,
+    t_lam: Sequence[float | None] | None,
+    t_neurons_sn: Sequence[float | None] | None,
     requested_output_names: Sequence[str] | None = None,
 ) -> None:
-    factor = int(downsample_factor)
-    if factor < 2:
-        raise ValueError(f"downsample_factor must be >= 2, got {factor}")
-    bf_name = "Bf.tif" if factor == 1 else f"Bf-d{factor}.tif"
-    b_name = "B.tif" if factor == 1 else f"B-d{factor}.tif"
-    ac_name = "AC.tif" if factor == 1 else f"AC-d{factor}.tif"
-    missing_outputs = _get_missing_model_outputs(
-        save_dir=save_dir,
-        factor=factor,
-        requested_output_names=requested_output_names,
+    y_load_fold, extract_load_fold = _resolve_patch_folders(
+        y_load_path,
+        extract_load_fold_cfg,
     )
-    if not missing_outputs:
-        return
-    output_paths = _model_output_path_map(save_dir, factor)
-    chunk = int(chunk_size)
-    if chunk <= 0:
-        raise ValueError(f"chunk_size must be > 0, got {chunk}")
-    # Keep model-product chunk small to control peak memory.
-    model_chunk = max(1, min(chunk, 4))
-
-    y_load_fold, model_load_fold = _resolve_patch_folders(y_load_path, model_load_fold_cfg)
-    patches = _collect_patch_meta(y_load_fold, model_load_fold)
+    extract_root = _resolve_extract_root(extract_load_fold)
+    profile_dir = extract_root / "profile"
+    qc_threshold_specs = _load_qc_threshold_specs(
+        extract_root=extract_root,
+        t_snr=t_snr,
+        t_r_value=t_r_value,
+        t_lam=t_lam,
+        t_neurons_sn=t_neurons_sn,
+    )
+    patches = _collect_patch_meta(y_load_fold, extract_load_fold)
     if not core_specs:
         raise ValueError("core_specs is empty; cannot stitch model products.")
     full_h = max(v[1] for v in core_specs.values())
@@ -668,254 +856,123 @@ def save_model_products_stitched(
         p.core_ly1 = p.core_ly0 + core_h
         p.core_lx1 = p.core_lx0 + core_w
 
-    full_h_ds = (full_h + factor - 1) // factor
-    full_w_ds = (full_w + factor - 1) // factor
-
-    for p in patches:
-        _prepare_patch_downsample_slices(p, factor)
-
-    # Silence verbose CaImAn parameter-diff logs during model loading.
     logging.getLogger("caiman").setLevel(logging.ERROR)
+    output_paths = _model_output_path_map(save_dir)
+    missing_outputs = _get_missing_model_outputs(
+        save_dir=save_dir,
+        requested_output_names=requested_output_names,
+    )
+    if not missing_outputs:
+        return
+    global_t = min(p.t for p in patches)
+    if global_t <= 0:
+        raise ValueError("No frames available from patch movies.")
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="save_model_tmp_", dir=save_dir))
-    try:
-        workers = _resolve_parallel_workers(
-            patches=patches,
-            model_chunk=model_chunk,
-            requested_workers=model_workers,
-            memory_usage_fraction=float(model_memory_fraction),
+    static_names = tuple(name for name in MODEL_STATIC_OUTPUT_ORDER if name in missing_outputs)
+    video_names = tuple(name for name in MODEL_VIDEO_OUTPUT_ORDER if name in missing_outputs)
+    qc_static_names = tuple(
+        name for name in MODEL_QC_STATIC_OUTPUT_ORDER if name in missing_outputs
+    )
+    qc_video_names = tuple(
+        name for name in MODEL_QC_VIDEO_OUTPUT_ORDER if name in missing_outputs
+    )
+    static_names_all = static_names + qc_static_names
+    video_names_all = video_names + qc_video_names
+    needs_video_zero_init = bool(video_names_all) and _grid_has_holes(patches, full_h, full_w)
+    need_ac = (
+        ("AC" in video_names_all)
+        or ("Bf" in video_names_all)
+        or ("B" in video_names_all)
+        or ("ACsum-qc" in static_names_all)
+        or ("AC-qc" in video_names_all)
+    )
+    need_acyra = (
+        ("ACYrA" in video_names_all)
+        or ("ACYrAsum" in static_names_all)
+        or ("ACYrAsum-qc" in static_names_all)
+        or ("ACYrA-qc" in video_names_all)
+    )
+    need_background = ("Bf" in video_names) or ("B" in video_names)
+    need_qc = bool(qc_static_names or qc_video_names)
+    if need_qc and not profile_dir.is_dir():
+        raise FileNotFoundError(
+            f"QC outputs requested but profile directory not found: {profile_dir}"
         )
 
-        # Phase 1: compute each patch result and save locally (memory-friendly).
-        t_use_by_patch: dict[str, int] = {}
-        if workers <= 1:
-            for p in tqdm.tqdm(
-                patches,
-                total=len(patches),
-                desc=_format_model_bar_desc("model", "->"),
-                unit="patch",
-                dynamic_ncols=True,
-            ):
-                patch_name, t_use = _process_single_patch_to_temp(
+    _cleanup_legacy_temp_dirs(save_dir)
+    created_paths: list[Path] = []
+    static_outputs: dict[str, np.memmap] = {}
+    video_outputs: dict[str, np.memmap] = {}
+    try:
+        for name in static_names_all:
+            path = output_paths[name]
+            static_outputs[name] = _create_output_memmap(
+                path=path,
+                shape=(full_h, full_w),
+                zero_init=True,
+            )
+            created_paths.append(path)
+        for name in video_names_all:
+            path = output_paths[name]
+            video_outputs[name] = _create_output_memmap(
+                path=path,
+                shape=(global_t, full_h, full_w),
+                zero_init=needs_video_zero_init,
+            )
+            created_paths.append(path)
+
+        progress_desc = "save(extract)"
+        if static_names_all and not video_names_all:
+            progress_desc = "save(extract2D)"
+        elif video_names_all and not static_names_all:
+            progress_desc = "save(extract3D)"
+
+        with tqdm.tqdm(
+            total=len(patches),
+            desc=progress_desc,
+            unit="patch",
+            dynamic_ncols=True,
+        ) as patch_progress_bar:
+            for p in patches:
+                patch_model_chunk = _choose_model_chunk(
                     p=p,
-                    tmp_dir=tmp_dir,
-                    factor=factor,
-                    model_chunk=model_chunk,
-                    bf_name=bf_name,
-                    b_name=b_name,
-                    ac_name=ac_name,
-                    save_bc="Bc" in missing_outputs,
-                    save_asum="Asum" in missing_outputs,
-                    save_acsum="ACsum" in missing_outputs,
-                    save_bf="Bf" in missing_outputs,
-                    save_b="B" in missing_outputs,
-                    save_ac="AC" in missing_outputs,
+                    global_t=global_t,
+                    need_ac=need_ac,
+                    need_acyra=need_acyra,
+                    need_background=need_background,
                 )
-                t_use_by_patch[patch_name] = t_use
-        else:
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                futures = [
-                    executor.submit(
-                        _process_single_patch_to_temp,
-                        p,
-                        tmp_dir,
-                        factor,
-                        model_chunk,
-                        bf_name,
-                        b_name,
-                        ac_name,
-                        "Bc" in missing_outputs,
-                        "Asum" in missing_outputs,
-                        "ACsum" in missing_outputs,
-                        "Bf" in missing_outputs,
-                        "B" in missing_outputs,
-                        "AC" in missing_outputs,
-                    )
-                    for p in patches
-                ]
-                with tqdm.tqdm(
-                    total=len(futures),
-                    desc=_format_model_bar_desc("model", "->"),
-                    unit="patch",
-                    dynamic_ncols=True,
-                ) as pbar:
-                    for future in as_completed(futures):
-                        patch_name, t_use = future.result()
-                        t_use_by_patch[patch_name] = t_use
-                        pbar.update(1)
-
-        for p in patches:
-            if p.patch_name not in t_use_by_patch:
-                raise RuntimeError(f"Missing t_use result for patch: {p.patch_name}")
-            p.t = int(t_use_by_patch[p.patch_name])
-
-        # Phase 2: stitch all patch results into final full-FOV outputs.
-        global_t = min(p.t for p in patches)
-        if global_t <= 0:
-            raise ValueError("No frames available after per-patch model processing.")
-
-        for output_name, patch_name in (
-            ("ACsum", "ACsum.tif"),
-            ("Asum", "Asum.tif"),
-            ("Bc", "Bc.tif"),
-        ):
-            if output_name not in missing_outputs:
-                continue
-            full_2d = np.zeros((full_h, full_w), dtype=np.float32)
-            for p in tqdm.tqdm(
-                patches,
-                total=len(patches),
-                desc=_format_model_bar_desc(output_name, "<-"),
-                unit="patch",
-                dynamic_ncols=True,
-            ):
-                patch_dir = tmp_dir / p.patch_name
-                patch_2d = tifffile.imread(patch_dir / patch_name).astype(
-                    np.float32, copy=False
+                _process_single_patch_into_outputs(
+                    p=p,
+                    global_t=global_t,
+                    model_chunk=patch_model_chunk,
+                    static_outputs=static_outputs,
+                    video_outputs=video_outputs,
+                    profile_dir=profile_dir if need_qc else None,
+                    qc_threshold_specs=qc_threshold_specs,
                 )
-                full_2d[p.y0 : p.y1, p.x0 : p.x1] = patch_2d
-            tifffile.imwrite(
-                output_paths[output_name],
-                full_2d,
-                imagej=True,
-                metadata={"axes": "YX"},
-            )
-
-        if "AC" in missing_outputs:
-            _stitch_video_from_temp(
-                patches=patches,
-                tmp_root=tmp_dir,
-                patch_video_name=ac_name,
-                out_path=output_paths["AC"],
-                full_h_ds=full_h_ds,
-                full_w_ds=full_w_ds,
-                global_t=global_t,
-            )
-        if "Bf" in missing_outputs:
-            _stitch_video_from_temp(
-                patches=patches,
-                tmp_root=tmp_dir,
-                patch_video_name=bf_name,
-                out_path=output_paths["Bf"],
-                full_h_ds=full_h_ds,
-                full_w_ds=full_w_ds,
-                global_t=global_t,
-            )
-        if "B" in missing_outputs:
-            _stitch_video_from_temp(
-                patches=patches,
-                tmp_root=tmp_dir,
-                patch_video_name=b_name,
-                out_path=output_paths["B"],
-                full_h_ds=full_h_ds,
-                full_w_ds=full_w_ds,
-                global_t=global_t,
-            )
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def save_downsampled_tif(
-    x_path: Path,
-    out_path: Path,
-    downsample_factor: int,
-    chunk_size: int,
-) -> None:
-    factor = int(downsample_factor)
-    if factor < 2:
-        raise ValueError(f"downsample_factor must be >= 2, got {factor}")
-    chunk = int(chunk_size)
-    if chunk <= 0:
-        raise ValueError(f"chunk_size must be > 0, got {chunk}")
-
-    with tifffile.TiffFile(x_path) as tif:
-        video = zarr.open(tif.aszarr(), mode="r")
-        if video.ndim == 2:
-            frame = np.asarray(video)
-            frame_ds = frame[::factor, ::factor]
-            with tifffile.TiffWriter(out_path, bigtiff=True) as writer:
-                writer.write(
-                    frame_ds,
-                    contiguous=True,
-                    photometric="minisblack",
-                )
-            return
-
-        if video.ndim != 3:
-            raise ValueError(f"Expected 2D or 3D TIFF, got ndim={video.ndim}: {x_path}")
-
-        t = int(video.shape[0])
-        total_chunks = (t + chunk - 1) // chunk
-        with tifffile.TiffWriter(out_path, bigtiff=True) as writer:
-            for start in tqdm.tqdm(
-                range(0, t, chunk),
-                total=total_chunks,
-                desc=f"save({out_path.stem})",
-                unit="chunk",
-                dynamic_ncols=True,
-            ):
-                end = min(start + chunk, t)
-                chunk_data = np.asarray(video[start:end])
-                down = chunk_data[:, ::factor, ::factor]
-                for frame in down:
-                    writer.write(
-                        frame,
-                        contiguous=True,
-                        photometric="minisblack",
-                    )
-
-
-def save_time_mean_tif(
-    x_path: Path,
-    out_path: Path,
-    chunk_size: int,
-) -> None:
-    chunk = int(chunk_size)
-    if chunk <= 0:
-        raise ValueError(f"chunk_size must be > 0, got {chunk}")
-
-    with tifffile.TiffFile(x_path) as tif:
-        video = zarr.open(tif.aszarr(), mode="r")
-        if video.ndim == 2:
-            tifffile.imwrite(
-                out_path,
-                np.asarray(video, dtype=np.float32),
-                photometric="minisblack",
-            )
-            return
-
-        if video.ndim != 3:
-            raise ValueError(f"Expected 2D or 3D TIFF, got ndim={video.ndim}: {x_path}")
-
-        t = int(video.shape[0])
-        h = int(video.shape[1])
-        w = int(video.shape[2])
-        acc = np.zeros((h, w), dtype=np.float64)
-        for start in range(0, t, chunk):
-            end = min(start + chunk, t)
-            chunk_data = np.asarray(video[start:end], dtype=np.float32)
-            acc += chunk_data.sum(axis=0, dtype=np.float64)
-            del chunk_data
-
-    mean_frame = (acc / max(t, 1)).astype(np.float32)
-    tifffile.imwrite(
-        out_path,
-        mean_frame,
-        photometric="minisblack",
-    )
+                patch_progress_bar.update(1)
+        for array in static_outputs.values():
+            array.flush()
+        for array in video_outputs.values():
+            array.flush()
+    except Exception:
+        static_outputs.clear()
+        video_outputs.clear()
+        for path in created_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def save_time_mean_std_tif(
     x_path: Path,
     mean_out_path: Path,
     std_out_path: Path,
-    chunk_size: int,
     save_mean: bool = True,
     save_std: bool = True,
 ) -> None:
-    chunk = int(chunk_size)
-    if chunk <= 0:
-        raise ValueError(f"chunk_size must be > 0, got {chunk}")
     if not save_mean and not save_std:
         return
     stats_label = ",".join(
@@ -952,27 +1009,13 @@ def save_time_mean_std_tif(
         h = int(video.shape[1])
         w = int(video.shape[2])
 
-        # Prefer a single pass over the time axis. The previous row-blocked
-        # version reread the full movie once per spatial block, which can make
-        # Ymean/Ystd several times slower on large TIFFs.
         pixel_count = max(1, h * w)
         float32_bytes = np.dtype(np.float32).itemsize
-        float64_bytes = np.dtype(np.float64).itemsize
-        target_stats_chunk_bytes = 128 * 1024 * 1024
-        stats_chunk = max(
-            1,
-            min(chunk, target_stats_chunk_bytes // max(1, pixel_count * float32_bytes)),
-        )
-
-        accumulator_bytes = pixel_count * float64_bytes * (1 + int(save_std))
-        scratch_bytes = stats_chunk * pixel_count * float32_bytes
-        mean_work_bytes = pixel_count * float64_bytes
-        estimated_working_set = accumulator_bytes + scratch_bytes + mean_work_bytes
-        available_memory = _get_available_memory_bytes()
-        can_use_single_pass = (
-            estimated_working_set <= 768 * 1024 * 1024
-            if available_memory is None
-            else estimated_working_set <= int(available_memory * 0.45)
+        stats_chunk, can_use_single_pass = _choose_stats_chunk(
+            t=t,
+            h=h,
+            w=w,
+            save_std=save_std,
         )
 
         if can_use_single_pass:
@@ -1023,10 +1066,10 @@ def save_time_mean_std_tif(
                 )
             return
 
-        # Low-memory fallback: smaller row blocks, but slower because it
-        # revisits the movie once per spatial block.
+        # Low-memory fallback: keep an automatically chosen time chunk and reduce
+        # spatial working set instead of failing the whole save.
         target_chunk_bytes = 64 * 1024 * 1024
-        bytes_per_row = max(1, chunk * w * float32_bytes)
+        bytes_per_row = max(1, stats_chunk * w * float32_bytes)
         row_block = max(1, min(h, target_chunk_bytes // bytes_per_row))
 
         if save_mean and mean_out_path.exists():
@@ -1071,8 +1114,8 @@ def save_time_mean_std_tif(
                 else None
             )
 
-            for start in range(0, t, chunk):
-                end = min(start + chunk, t)
+            for start in range(0, t, stats_chunk):
+                end = min(start + stats_chunk, t)
                 chunk_data = np.asarray(video[start:end, y0:y1, :], dtype=np.float32)
                 block_sum += chunk_data.sum(axis=0, dtype=np.float64)
                 if save_std and block_sumsq is not None:
@@ -1104,30 +1147,42 @@ def _is_complete_file(path: Path) -> bool:
         return False
 
 
-def _model_output_path_map(save_dir: Path, factor: int) -> dict[str, Path]:
-    bf_name = "Bf.tif" if factor == 1 else f"Bf-d{factor}.tif"
-    b_name = "B.tif" if factor == 1 else f"B-d{factor}.tif"
-    ac_name = "AC.tif" if factor == 1 else f"AC-d{factor}.tif"
+def _cleanup_legacy_temp_dirs(save_dir: Path) -> None:
+    for name in LEGACY_TEMP_OUTPUT_DIRS:
+        path = save_dir / name
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _crop_core_2d(p: PatchMeta, frame: np.ndarray) -> np.ndarray:
+    return frame[p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
+
+
+def _crop_core_3d(p: PatchMeta, frames: np.ndarray) -> np.ndarray:
+    return frames[:, p.core_ly0 : p.core_ly1, p.core_lx0 : p.core_lx1]
+
+
+def _model_output_path_map(save_dir: Path) -> dict[str, Path]:
     return {
         "Bc": save_dir / "Bc.tif",
-        "Asum": save_dir / "Asum.tif",
         "ACsum": save_dir / "ACsum.tif",
-        "Bf": save_dir / bf_name,
-        "B": save_dir / b_name,
-        "AC": save_dir / ac_name,
+        "ACYrAsum": save_dir / "ACYrAsum.tif",
+        "ACsum-qc": save_dir / "ACsum-qc.tif",
+        "ACYrAsum-qc": save_dir / "ACYrAsum-qc.tif",
+        "Bf": save_dir / "Bf.tif",
+        "B": save_dir / "B.tif",
+        "AC": save_dir / "AC.tif",
+        "ACYrA": save_dir / "ACYrA.tif",
+        "AC-qc": save_dir / "AC-qc.tif",
+        "ACYrA-qc": save_dir / "ACYrA-qc.tif",
     }
-
-
-def _model_output_paths(save_dir: Path, factor: int) -> list[Path]:
-    return list(_model_output_path_map(save_dir, factor).values())
 
 
 def _get_missing_model_outputs(
     save_dir: Path,
-    factor: int,
     requested_output_names: Sequence[str] | None = None,
 ) -> dict[str, Path]:
-    output_paths = _model_output_path_map(save_dir, factor)
+    output_paths = _model_output_path_map(save_dir)
     requested_names = (
         MODEL_OUTPUT_ORDER
         if requested_output_names is None
@@ -1144,68 +1199,43 @@ def _get_missing_model_outputs(
 
 
 def _format_model_bar_desc(name: str, direction: str) -> str:
-    return f"save({name.rjust(MODEL_BAR_LABEL_WIDTH)}{direction}temp)"
-
-
-def normalize_downsample_factors(raw: object) -> list[int]:
-    if isinstance(raw, (int, np.integer)):
-        factors = [int(raw)]
-    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
-        factors = [int(x) for x in raw]
-    else:
-        raise ValueError(
-            "downsample_factor must be an integer or a list of integers, "
-            f"got {type(raw).__name__}"
-        )
-
-    if not factors:
-        raise ValueError("downsample_factor list cannot be empty.")
-
-    unique: list[int] = []
-    seen: set[int] = set()
-    for f in factors:
-        if f < 2:
-            raise ValueError(f"downsample_factor values must be >= 2, got {f}")
-        if f in seen:
-            continue
-        seen.add(f)
-        unique.append(f)
-    return unique
+    return f"save({name.rjust(MODEL_BAR_LABEL_WIDTH)}{direction}out)"
 
 
 def run(
     x_load_path: str,
     y_load_path: str,
-    model_load_fold: str | None,
+    extract_load_fold: str | None,
     save_fold: str | None,
-    para_load_path: str | None,
-    downsample_factor: object,
-    chunk_size: int,
-    model_workers: int | None = None,
-    model_memory_fraction: float = 0.55,
+    crop_load_path: str | None,
+    t_snr: Sequence[float | None] | None,
+    t_r_value: Sequence[float | None] | None,
+    t_lam: Sequence[float | None] | None,
+    t_neurons_sn: Sequence[float | None] | None,
+    extract2d: bool = True,
+    extract3d: bool = True,
 ) -> None:
     input_path = Path(x_load_path)
     y_input_path = Path(y_load_path)
     plot_dir = (
         Path(save_fold)
         if save_fold is not None
-        else input_path.parent / "save"
+        else y_input_path.parent
     )
     x_base = input_path.with_suffix("").name
     y_base = y_input_path.with_suffix("").name
-    downsample_factors = normalize_downsample_factors(downsample_factor)
     save_path_mean_x = plot_dir / f"{x_base}mean.tif"
     save_path_std_x = plot_dir / f"{x_base}std.tif"
     save_path_mean_y = plot_dir / f"{y_base}mean.tif"
     save_path_std_y = plot_dir / f"{y_base}std.tif"
 
     plot_dir.mkdir(parents=True, exist_ok=True)
-    resolved_model_load_fold = (
-        y_input_path.parent / "model"
-        if model_load_fold is None
-        else Path(model_load_fold)
+    resolved_extract_load_fold = (
+        y_input_path.parent / "extract"
+        if extract_load_fold is None
+        else Path(extract_load_fold)
     )
-    should_save_model_products = resolved_model_load_fold.is_dir()
+    should_save_model_products = resolved_extract_load_fold.is_dir()
 
     if (
         not _is_complete_file(save_path_mean_x)
@@ -1217,7 +1247,6 @@ def run(
             x_path=input_path,
             mean_out_path=save_path_mean_x,
             std_out_path=save_path_std_x,
-            chunk_size=int(chunk_size),
             save_mean=need_mean_x,
             save_std=need_std_x,
         )
@@ -1232,60 +1261,59 @@ def run(
             x_path=y_input_path,
             mean_out_path=save_path_mean_y,
             std_out_path=save_path_std_y,
-            chunk_size=int(chunk_size),
             save_mean=need_mean_y,
             save_std=need_std_y,
         )
 
     core_specs: dict[str, tuple[int, int, int, int]] | None = None
-    for factor in downsample_factors:
-        save_path_downsample_x = plot_dir / f"{x_base}-d{factor}.tif"
-        save_path_downsample_y = plot_dir / f"{y_base}-d{factor}.tif"
-        if not _is_complete_file(save_path_downsample_x):
-            save_downsampled_tif(
-                x_path=input_path,
-                out_path=save_path_downsample_x,
-                downsample_factor=factor,
-                chunk_size=int(chunk_size),
-            )
-        if not _is_complete_file(save_path_downsample_y):
-            save_downsampled_tif(
-                x_path=y_input_path,
-                out_path=save_path_downsample_y,
-                downsample_factor=factor,
-                chunk_size=int(chunk_size),
-            )
-
     if should_save_model_products:
-        for factor in downsample_factors:
-            factor_int = int(factor)
-            missing_outputs = _get_missing_model_outputs(
-                save_dir=plot_dir,
-                factor=factor_int,
-                requested_output_names=MODEL_OUTPUT_ORDER,
-            )
-            if not missing_outputs:
-                continue
-            if para_load_path is None:
-                raise ValueError("save requires para_load_path pointing to crop para.json.")
+        requested_2d_output_names = MODEL_2D_OUTPUT_ORDER if extract2d else ()
+        requested_3d_output_names = MODEL_3D_OUTPUT_ORDER if extract3d else ()
+        missing_2d_outputs = _get_missing_model_outputs(
+            save_dir=plot_dir,
+            requested_output_names=requested_2d_output_names,
+        )
+        missing_3d_outputs = _get_missing_model_outputs(
+            save_dir=plot_dir,
+            requested_output_names=requested_3d_output_names,
+        )
+
+        if missing_2d_outputs or missing_3d_outputs:
+            if crop_load_path is None:
+                raise ValueError("save requires crop_load_path pointing to the crop folder.")
             if core_specs is None:
-                crop_params = load_crop_params(Path(para_load_path))
+                crop_params = load_crop_params(Path(crop_load_path))
                 patch_specs = crop_params["patch_specs"]
                 core_specs = {
                     spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
                     for spec in patch_specs
                 }
-            save_model_products_stitched(
-                y_load_path=y_input_path,
-                model_load_fold_cfg=str(resolved_model_load_fold),
-                core_specs=core_specs,
-                save_dir=plot_dir,
-                downsample_factor=factor_int,
-                chunk_size=int(chunk_size),
-                model_workers=model_workers,
-                model_memory_fraction=float(model_memory_fraction),
-                requested_output_names=MODEL_OUTPUT_ORDER,
-            )
+
+            if missing_2d_outputs:
+                save_model_products_stitched(
+                    y_load_path=y_input_path,
+                    extract_load_fold_cfg=str(resolved_extract_load_fold),
+                    core_specs=core_specs,
+                    save_dir=plot_dir,
+                    t_snr=t_snr,
+                    t_r_value=t_r_value,
+                    t_lam=t_lam,
+                    t_neurons_sn=t_neurons_sn,
+                    requested_output_names=requested_2d_output_names,
+                )
+
+            if missing_3d_outputs:
+                save_model_products_stitched(
+                    y_load_path=y_input_path,
+                    extract_load_fold_cfg=str(resolved_extract_load_fold),
+                    core_specs=core_specs,
+                    save_dir=plot_dir,
+                    t_snr=t_snr,
+                    t_r_value=t_r_value,
+                    t_lam=t_lam,
+                    t_neurons_sn=t_neurons_sn,
+                    requested_output_names=requested_3d_output_names,
+                )
 
 
 class Save:
@@ -1293,36 +1321,44 @@ class Save:
         self,
         x_load_path: str,
         y_load_path: str,
-        model_load_fold: str | None,
+        extract_load_fold: str | None,
         save_fold: str | None,
-        para_load_path: str | None,
-        downsample_factor: object,
-        chunk_size: int,
-        model_workers: int | None = None,
-        model_memory_fraction: float = 0.55,
+        crop_load_path: str | None,
+        t_snr: Sequence[float | None] | None,
+        t_r_value: Sequence[float | None] | None,
+        t_lam: Sequence[float | None] | None,
+        t_neurons_sn: Sequence[float | None] | None,
+        extract2d: bool = True,
+        extract3d: bool = True,
+        enable: bool = True,
         **kwargs,
     ) -> None:
+        if kwargs:
+            unknown_keys = ", ".join(sorted(kwargs.keys()))
+            raise TypeError(f"Unexpected save config keys: {unknown_keys}")
         self.x_load_path = x_load_path
         self.y_load_path = y_load_path
-        self.model_load_fold = model_load_fold
+        self.extract_load_fold = extract_load_fold
         self.save_fold = save_fold
-        self.para_load_path = para_load_path
-        self.downsample_factor = downsample_factor
-        self.chunk_size = int(chunk_size)
-        self.model_workers = (
-            None if model_workers is None else int(model_workers)
-        )
-        self.model_memory_fraction = float(model_memory_fraction)
+        self.crop_load_path = crop_load_path
+        self.t_snr = _normalize_qc_bounds(t_snr, "snr")
+        self.t_r_value = _normalize_qc_bounds(t_r_value, "r_value")
+        self.t_lam = _normalize_qc_bounds(t_lam, "lam")
+        self.t_neurons_sn = _normalize_qc_bounds(t_neurons_sn, "neurons_sn")
+        self.extract2d = bool(extract2d)
+        self.extract3d = bool(extract3d)
 
     def forward(self) -> None:
         run(
             x_load_path=self.x_load_path,
             y_load_path=self.y_load_path,
-            model_load_fold=self.model_load_fold,
+            extract_load_fold=self.extract_load_fold,
             save_fold=self.save_fold,
-            para_load_path=self.para_load_path,
-            downsample_factor=self.downsample_factor,
-            chunk_size=self.chunk_size,
-            model_workers=self.model_workers,
-            model_memory_fraction=self.model_memory_fraction,
+            crop_load_path=self.crop_load_path,
+            t_snr=self.t_snr,
+            t_r_value=self.t_r_value,
+            t_lam=self.t_lam,
+            t_neurons_sn=self.t_neurons_sn,
+            extract2d=self.extract2d,
+            extract3d=self.extract3d,
         )

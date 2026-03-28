@@ -1,0 +1,15 @@
+save:
+  # path
+  x_load_path: ???
+  y_load_path: ???
+  crop_load_path: ???
+  extract_load_fold: ???
+  save_fold: ???
+  # enable
+  extract2d: true
+  extract3d: false
+  # threshold
+  t_snr: [null, 3.5]
+  t_r_value: [-0.3, null]
+  t_lam: [-1.0, null]
+  t_neurons_sn: [-0.6, null]

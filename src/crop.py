@@ -201,6 +201,34 @@ def overlay_white_lines(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     rgb[mask] = np.asarray((255, 255, 255), dtype=np.uint8)
     return rgb
 
+
+def render_quadrant_lines_only(
+    shape: tuple[int, int],
+    masks: list[np.ndarray],
+) -> np.ndarray:
+    rgb = np.zeros((int(shape[0]), int(shape[1]), 3), dtype=np.uint8)
+    colors = np.array(
+        [
+            [255, 64, 64],   # top-left
+            [255, 200, 40],  # top-right
+            [64, 196, 96],   # bottom-left
+            [64, 128, 255],  # bottom-right
+        ],
+        dtype=np.uint8,
+    )
+    for idx, mask in enumerate(masks):
+        rgb[mask] = colors[idx]
+    return rgb
+
+
+def render_white_lines_only(
+    shape: tuple[int, int],
+    mask: np.ndarray,
+) -> np.ndarray:
+    rgb = np.zeros((int(shape[0]), int(shape[1]), 3), dtype=np.uint8)
+    rgb[mask] = np.asarray((255, 255, 255), dtype=np.uint8)
+    return rgb
+
 def stitch_image(
     image: np.ndarray,
     match_point_1: tuple[tuple[int, int], tuple[int, int]],
@@ -454,68 +482,26 @@ def _load_json(path: Path) -> dict:
 
 
 def load_crop_stitch_params(
-    para_load_path: Path,
+    stitch_load_fold: Path,
     *,
     pre_stitch_shape: tuple[int, int] | None = None,
 ) -> dict[str, object]:
-    para_load_path = Path(para_load_path)
-    root_dir = para_load_path if para_load_path.is_dir() else para_load_path.parent
-
-    if para_load_path.is_dir():
-        root_candidates = [para_load_path / "para.json", para_load_path / "crop_stitch_params.json"]
-    else:
-        root_candidates = [para_load_path]
-        if para_load_path.name == "para.json":
-            root_candidates.append(para_load_path.with_name("crop_stitch_params.json"))
-        elif para_load_path.name == "crop_stitch_params.json":
-            root_candidates.append(para_load_path.with_name("para.json"))
-
-    for crop_params_path in root_candidates:
-        if not crop_params_path.exists():
-            continue
-        payload = _load_json(crop_params_path)
-        if pre_stitch_shape is not None and "pre_stitch_shape" not in payload:
-            payload["pre_stitch_shape"] = [int(pre_stitch_shape[0]), int(pre_stitch_shape[1])]
-        return payload
-
-    final_dir = root_dir / "LR"
-    if not final_dir.exists():
-        alt_final_dir = root_dir / "RL"
-        if alt_final_dir.exists():
-            final_dir = alt_final_dir
-
-    left_json = root_dir / "L" / "selection.json"
-    right_json = root_dir / "R" / "selection.json"
-    final_json = final_dir / "selection.json"
-    if not (left_json.exists() and right_json.exists() and final_json.exists()):
-        raise FileNotFoundError(
-            "Could not find para.json via para_load_path, and no legacy crop_stitch_params.json/selection.json files were available."
+    stitch_load_fold = Path(stitch_load_fold)
+    if not stitch_load_fold.is_dir():
+        raise NotADirectoryError(
+            f"stitch_load_fold must be an existing directory: {stitch_load_fold}"
         )
 
-    left_payload = _load_json(left_json)
-    right_payload = _load_json(right_json)
-    final_payload = _load_json(final_json)
-    payload: dict[str, object] = {
-        "version": 1,
-        "order": "vertical_then_horizontal",
-        "left": {
-            "offset_y": float(left_payload["offset_y"]),
-            "offset_x": float(left_payload["offset_x"]),
-            "selection_json": str(left_json),
-        },
-        "right": {
-            "offset_y": float(right_payload["offset_y"]),
-            "offset_x": float(right_payload["offset_x"]),
-            "selection_json": str(right_json),
-        },
-        "final": {
-            "offset_y": float(final_payload["offset_y"]),
-            "offset_x": float(final_payload["offset_x"]),
-            "selection_json": str(final_json),
-        },
-    }
+    para_path = stitch_load_fold / "para.json"
+    if not para_path.exists():
+        raise FileNotFoundError(f"Stitch para.json not found: {para_path}")
+
+    payload = _load_json(para_path)
     if pre_stitch_shape is not None:
-        payload["pre_stitch_shape"] = [int(pre_stitch_shape[0]), int(pre_stitch_shape[1])]
+        payload.setdefault(
+            "pre_stitch_shape",
+            [int(pre_stitch_shape[0]), int(pre_stitch_shape[1])],
+        )
     return payload
 
 
@@ -580,12 +566,13 @@ def save_crop_params(
     )
 
 
-def load_crop_params(para_load_path: Path) -> dict[str, object]:
-    para_load_path = Path(para_load_path)
-    if para_load_path.is_dir():
-        para_path = para_load_path / "para.json"
-    else:
-        para_path = para_load_path
+def load_crop_params(crop_load_fold: Path) -> dict[str, object]:
+    crop_load_fold = Path(crop_load_fold)
+    if not crop_load_fold.is_dir():
+        raise NotADirectoryError(
+            f"crop_load_fold must be a crop folder containing para.json: {crop_load_fold}"
+        )
+    para_path = crop_load_fold / "para.json"
     if not para_path.exists():
         raise FileNotFoundError(f"Crop para.json not found: {para_path}")
     payload = _load_json(para_path)
@@ -1195,7 +1182,7 @@ def save_crop_visualizations(
     *,
     x_load_path: Path,
     y_load_path: Path,
-    result_save_fold: Path,
+    crop_save_fold: Path,
     patch_specs: list[PatchSpec],
     seam_width: int,
     tile_size: int,
@@ -1205,11 +1192,12 @@ def save_crop_visualizations(
     match_point_2: tuple[tuple[int, int], tuple[int, int]] | None = None,
     match_point_3: tuple[tuple[int, int], tuple[int, int]] | None = None,
 ) -> None:
-    result_save_fold.mkdir(parents=True, exist_ok=True)
-    save_path_1 = result_save_fold / "crop-1.tif"
-    save_path_2 = result_save_fold / "crop-2.tif"
-    save_path_3 = result_save_fold / "crop-3.tif"
-    save_path_4 = result_save_fold / "crop-4.tif"
+    crop_save_fold.mkdir(parents=True, exist_ok=True)
+    save_path_1 = crop_save_fold / "crop-1.tif"
+    save_path_2 = crop_save_fold / "crop-2.tif"
+    save_path_3 = crop_save_fold / "crop-3.tif"
+    save_path_4 = crop_save_fold / "crop-4.tif"
+    save_path_4.unlink(missing_ok=True)
 
     first_frame_y = read_first_frame(y_load_path)
 
@@ -1222,7 +1210,7 @@ def save_crop_visualizations(
             tile_size=tile_size,
             seam_width=seam_width,
         )
-        overlay_rgb = overlay_quadrant_grid(first_frame_x, masks)
+        overlay_rgb = render_quadrant_lines_only((h, w), masks)
         save_image(save_path_1, overlay_rgb)
 
         if stitch_params is not None:
@@ -1274,14 +1262,11 @@ def save_crop_visualizations(
             patch_specs=patch_specs,
             seam_width=seam_width,
         )
-        crop_overlay = overlay_white_lines(first_frame_y, crop_mask)
-        save_image(save_path_3, crop_overlay)
-        seam_only = np.zeros(
-            (int(first_frame_y.shape[0]), int(first_frame_y.shape[1]), 3),
-            dtype=np.uint8,
+        seam_only = render_white_lines_only(
+            (int(first_frame_y.shape[0]), int(first_frame_y.shape[1])),
+            crop_mask,
         )
-        seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
-        save_image(save_path_4, seam_only)
+        save_image(save_path_3, seam_only)
         return
 
     crop_mask = build_patch_boundary_mask(
@@ -1289,24 +1274,21 @@ def save_crop_visualizations(
         patch_specs=patch_specs,
         seam_width=max(2, int(seam_width)),
     )
-    crop_overlay = overlay_white_lines(first_frame_y, crop_mask)
-    seam_only = np.zeros(
-        (int(first_frame_y.shape[0]), int(first_frame_y.shape[1]), 3),
-        dtype=np.uint8,
+    seam_only = render_white_lines_only(
+        (int(first_frame_y.shape[0]), int(first_frame_y.shape[1])),
+        crop_mask,
     )
-    seam_only[crop_mask] = np.asarray((255, 255, 255), dtype=np.uint8)
-    save_image(save_path_1, crop_overlay)
     save_image(save_path_2, seam_only)
-    save_image(save_path_3, crop_overlay)
-    save_image(save_path_4, seam_only)
+    save_image(save_path_1, seam_only)
+    save_image(save_path_3, seam_only)
 
 
 def run(
     x_load_path: str,
     y_load_path: str,
     y_save_fold: str | None,
-    result_save_fold: str | None,
-    para_load_path: str | None,
+    crop_save_fold: str | None,
+    stitch_load_fold: str | None,
     frame: Sequence[int],
     chunk_size: int,
     after_stitch: bool,
@@ -1353,9 +1335,9 @@ def run(
             raise ValueError(
                 f"seam_width must be an even integer >= 2, got {seam_width}"
             )
-        if para_load_path is not None:
+        if stitch_load_fold is not None:
             stitch_params = load_crop_stitch_params(
-                Path(para_load_path), pre_stitch_shape=(h, w)
+                Path(stitch_load_fold), pre_stitch_shape=(h, w)
             )
             left = stitch_params["left"]
             right = stitch_params["right"]
@@ -1383,7 +1365,7 @@ def run(
         else:
             if match_point_1 is None or match_point_2 is None or match_point_3 is None:
                 raise ValueError(
-                    "after_stitch=True requires either para_load_path or all of match_point_1/match_point_2/match_point_3."
+                    "after_stitch=True requires either stitch_load_fold or all of match_point_1/match_point_2/match_point_3."
                 )
             mp1 = parse_match_point(match_point_1, "match_point_1")
             mp2 = parse_match_point(match_point_2, "match_point_2")
@@ -1414,8 +1396,8 @@ def run(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_dir = (
-        Path(result_save_fold)
-        if result_save_fold is not None
+        Path(crop_save_fold)
+        if crop_save_fold is not None
         else patch_input.parent / "crop"
     )
     save_crop_params(
@@ -1427,7 +1409,7 @@ def run(
     save_crop_visualizations(
         x_load_path=Path(x_load_path),
         y_load_path=patch_input,
-        result_save_fold=plot_dir,
+        crop_save_fold=plot_dir,
         patch_specs=patch_specs,
         seam_width=int(seam_width),
         tile_size=int(tile_size),
@@ -1461,8 +1443,8 @@ class Crop:
         x_load_path: str,
         y_load_path: str,
         y_save_fold: str | None,
-        result_save_fold: str | None,
-        para_load_path: str | None,
+        crop_save_fold: str | None,
+        stitch_load_fold: str | None,
         frame: Sequence[int],
         chunk_size: int,
         after_stitch: bool,
@@ -1479,8 +1461,8 @@ class Crop:
         self.x_load_path = x_load_path
         self.y_load_path = y_load_path
         self.y_save_fold = y_save_fold
-        self.result_save_fold = result_save_fold
-        self.para_load_path = para_load_path
+        self.crop_save_fold = crop_save_fold
+        self.stitch_load_fold = stitch_load_fold
         self.frame = list(frame)
         self.chunk_size = int(chunk_size)
         self.after_stitch = bool(after_stitch)
@@ -1498,8 +1480,8 @@ class Crop:
             x_load_path=self.x_load_path,
             y_load_path=self.y_load_path,
             y_save_fold=self.y_save_fold,
-            result_save_fold=self.result_save_fold,
-            para_load_path=self.para_load_path,
+            crop_save_fold=self.crop_save_fold,
+            stitch_load_fold=self.stitch_load_fold,
             frame=self.frame,
             chunk_size=self.chunk_size,
             after_stitch=self.after_stitch,

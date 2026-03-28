@@ -1,9 +1,9 @@
 crop:
   x_load_path: ???
   y_load_path: ???
-  para_load_path: ???
+  stitch_load_fold: ???
   y_save_fold: ???
-  result_save_fold: ???
+  crop_save_fold: ???
   frame: [0, -1]
   chunk_size: 32
   # true: stitched seam-aware patching; 

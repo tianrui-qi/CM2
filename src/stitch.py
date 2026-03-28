@@ -2026,7 +2026,8 @@ def run(args: argparse.Namespace) -> int:
     save_stitched_preview_cropped(result_save_fold / "R", "result-4.png", right_stitched_transition, right_crop_bounds)
     right_stitched_transition_cropped = crop_image(right_stitched_transition, right_crop_bounds)
 
-    existing_root_para_path = result_save_fold / "para.json"
+    root_para_path = result_save_fold / "para.json"
+    existing_root_para_path = root_para_path
     allow_final_para_reuse = left_reused and right_reused and _root_para_supports_stage_crops(existing_root_para_path)
     final_result, _final_paths, _final_reused = run_pair_alignment(pair_label="Final left-right", reference_label="left", moving_label="right", reference_image=left_stitched_transition_cropped, moving_image=right_stitched_transition_cropped, initial_reference_roi=final_left_roi, initial_moving_roi=final_right_roi, initial_fit_window=final_fit_window, initial_fit_point=final_fit_point, output_dir=result_save_fold / "LR", preprocessing_mode=mode_triplet[2], vessel_keep_percent=vessel_keep_percent, frangi_sigmas=frangi_sigmas, fit_point_radius=fit_point_radius, stitch_axis="horizontal", roi_selector_mode="horizontal_mirror", stage_para_path=final_para_path, allow_para_reuse=allow_final_para_reuse)
 
@@ -2036,7 +2037,7 @@ def run(args: argparse.Namespace) -> int:
     save_stitched_preview_cropped(result_save_fold / "LR", "result-3.png", final_stitched_raw, final_crop_bounds)
     save_stitched_preview_cropped(result_save_fold / "LR", "result-4.png", final_stitched_transition, final_crop_bounds)
 
-    save_root_para(result_save_fold / "para.json", pre_stitch_shape=projection.shape, estimation_frame=estimation_frame, left_result=left_result, right_result=right_result, final_result=final_result, left_crop_bounds=left_crop_bounds, right_crop_bounds=right_crop_bounds, final_crop_bounds=final_crop_bounds)
+    save_root_para(root_para_path, pre_stitch_shape=projection.shape, estimation_frame=estimation_frame, left_result=left_result, right_result=right_result, final_result=final_result, left_crop_bounds=left_crop_bounds, right_crop_bounds=right_crop_bounds, final_crop_bounds=final_crop_bounds)
     write_stitched_tiff(x_load_path, y_save_path, left_result, right_result, final_result, chunk_size=chunk_size, left_crop_bounds=left_crop_bounds, right_crop_bounds=right_crop_bounds, final_crop_bounds=final_crop_bounds)
     return 0
 
@@ -2073,7 +2074,7 @@ class Stitch:
         self,
         x_load_path: str | Path,
         y_save_path: str | Path,
-        result_save_fold: str | Path | None = None,
+        stitch_save_fold: str | Path | None = None,
         result_save_folder: str | Path | None = None,
         frame: Sequence[int] = (0, -1),
         max_frames: int | None = None,
@@ -2101,7 +2102,9 @@ class Stitch:
         self.enable = bool(enable)
         self.x_load_path = Path(x_load_path)
         self.y_save_path = Path(y_save_path)
-        self.result_save_fold = _as_path(result_save_fold if result_save_fold is not None else result_save_folder)
+        self.stitch_save_fold = _as_path(
+            stitch_save_fold if stitch_save_fold is not None else result_save_folder
+        )
         if max_frames is not None and tuple(int(v) for v in frame) == (0, -1):
             frame = (0, int(max_frames))
         self.frame = _as_frame_range(frame)
@@ -2134,8 +2137,8 @@ class Stitch:
         args = argparse.Namespace(
             x_load_path=self.x_load_path,
             y_save_path=self.y_save_path,
-            result_save_fold=self.result_save_fold,
-            result_save_folder=self.result_save_fold,
+            result_save_fold=self.stitch_save_fold,
+            result_save_folder=self.stitch_save_fold,
             data_path=None,
             output_dir=None,
             frame=self.frame,
