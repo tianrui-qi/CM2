@@ -30,7 +30,9 @@ def main(cfg: omegaconf.DictConfig) -> None:
             Path(cfg.extract.y_load_fold).parent / "extract"
         )
     if cfg.save.save_fold is None:
-        cfg.save.save_fold = str(Path(cfg.save.y_load_path).parent)
+        cfg.save.save_fold = str(
+            Path(cfg.save.y_load_path).parent / "save"
+        )
     # forward
     if cfg.stitch.enable:
         src.Stitch(**cfg.stitch).forward()

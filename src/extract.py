@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import math
 import os
 import warnings
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -119,6 +120,8 @@ QUALITY_METRIC_SPECS: tuple[QualityMetricSpec, ...] = (
     QualityMetricSpec("neurons_sn", "sn", "log", "RdBu"),
     QualityMetricSpec("g_0", "g0", "linear", "RdBu"),
     QualityMetricSpec("g_1", "g1", "linear", "RdBu"),
+    QualityMetricSpec("t_peak", "tpeak", "linear", "RdBu"),
+    QualityMetricSpec("t_half", "thalf", "linear", "RdBu"),
     QualityMetricSpec(
         "r_value_unreliable_joint_only",
         "join",
@@ -131,7 +134,13 @@ QUALITY_THRESHOLD_Z_VALUES = np.round(np.arange(-3.0, 3.0 + 1e-9, 0.1), 1)
 QUALITY_THRESHOLD_ACCEPT_RGB = np.array([0, 0, 255], dtype=np.uint8)
 QUALITY_THRESHOLD_REJECT_RGB = np.array([255, 0, 0], dtype=np.uint8)
 QUALITY_THRESHOLD_JOIN_ACCEPT_RGB = np.array([0, 0, 255], dtype=np.uint8)
-QUALITY_THRESHOLD_BAD_HIGH_KEYS = frozenset({"bl", "g_1"})
+QUALITY_THRESHOLD_BAD_HIGH_KEYS = frozenset({"bl", "g_1", "t_peak", "t_half"})
+QUALITY_STATUS_FIGURE_SIZE = (6.0, 4.5)
+
+AUTOREGRESSIVE_BACKGROUND_TRACE_RGBA = (0.52, 0.60, 0.70, 0.020)
+AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR = "#74889A"
+AUTOREGRESSIVE_MAIN_TRACE_COLOR = "#C65D3B"
+AUTOREGRESSIVE_GRID_COLOR = "#D7DDE5"
 
 
 def _to_container(value: Any) -> Any:
@@ -337,11 +346,11 @@ def run_single_patch(
 
 
 def get_model_dir(extract_dir: Path) -> Path:
-    return extract_dir / "model"
+    return extract_dir / "patch-model"
 
 
 def get_profile_dir(extract_dir: Path) -> Path:
-    return extract_dir / "profile"
+    return extract_dir / "patch-profile"
 
 
 def get_figure_spatialmap_dir(extract_dir: Path) -> Path:
@@ -368,12 +377,20 @@ def get_profile_csv_path(movie_path: Path, extract_dir: Path) -> Path:
     return get_profile_dir(extract_dir) / f"{movie_path.name}.csv"
 
 
+def get_stats_dir(extract_dir: Path) -> Path:
+    return extract_dir / "stats"
+
+
 def get_stats_path(extract_dir: Path) -> Path:
-    return extract_dir / "stats.json"
+    return get_stats_dir(extract_dir) / "stats.json"
 
 
-def get_stats_png_path(extract_dir: Path) -> Path:
-    return extract_dir / "stats.png"
+def get_stats_metric_png_path(extract_dir: Path, metric_key: str) -> Path:
+    return get_stats_dir(extract_dir) / f"{metric_key}.png"
+
+
+def get_autoregressive_png_path(extract_dir: Path) -> Path:
+    return get_stats_dir(extract_dir) / "autoregressive.png"
 
 
 def save_model(
@@ -502,6 +519,128 @@ def _component_g_matrix(value: Any, n_components: int) -> np.ndarray:
     raise ValueError(f"Unsupported g shape for component metadata: {arr.shape}")
 
 
+def _roots_from_g(g0: float, g1: float) -> tuple[float, float]:
+    disc = g0 * g0 + 4.0 * g1
+    if disc <= 0.0:
+        raise ValueError(f"Expected positive discriminant, got {disc}")
+    sqrt_disc = math.sqrt(disc)
+    r1 = 0.5 * (g0 + sqrt_disc)
+    r2 = 0.5 * (g0 - sqrt_disc)
+    if not (0.0 < r1 < 1.0 and 0.0 < r2 < 1.0):
+        raise ValueError(f"Unexpected roots for calcium kernel: r1={r1}, r2={r2}")
+    return r1, r2
+
+
+def _tau_from_root(root: float, dt_s: float) -> float:
+    return -dt_s / math.log(root)
+
+
+def _continuous_kernel_value(t_s: float, tau_fast_s: float, tau_slow_s: float) -> float:
+    return math.exp(-t_s / tau_slow_s) - math.exp(-t_s / tau_fast_s)
+
+
+def _continuous_kernel_shape(
+    t_s: np.ndarray,
+    tau_fast_s: float,
+    tau_slow_s: float,
+) -> np.ndarray:
+    y = np.exp(-t_s / tau_slow_s) - np.exp(-t_s / tau_fast_s)
+    y[y < 0.0] = 0.0
+    peak = float(np.max(y))
+    if peak <= 0.0:
+        raise ValueError("Kernel peak must be positive.")
+    return y / peak
+
+
+def _t_peak_continuous(tau_fast_s: float, tau_slow_s: float) -> float:
+    return (
+        tau_fast_s
+        * tau_slow_s
+        / (tau_slow_s - tau_fast_s)
+        * math.log(tau_slow_s / tau_fast_s)
+    )
+
+
+def _half_decay_after_peak_continuous(
+    tau_fast_s: float,
+    tau_slow_s: float,
+    t_peak_s: float,
+) -> tuple[float, float]:
+    peak_value = _continuous_kernel_value(t_peak_s, tau_fast_s, tau_slow_s)
+    if peak_value <= 0.0:
+        raise RuntimeError("Kernel peak must be positive.")
+    target = 0.5 * peak_value
+    lo = t_peak_s
+    hi = t_peak_s + 20.0 * tau_slow_s
+    while _continuous_kernel_value(hi, tau_fast_s, tau_slow_s) > target:
+        hi += 10.0 * tau_slow_s
+        if hi > t_peak_s + 200.0 * tau_slow_s:
+            raise RuntimeError("Failed to bracket half-decay crossing.")
+    for _ in range(120):
+        mid = 0.5 * (lo + hi)
+        if _continuous_kernel_value(mid, tau_fast_s, tau_slow_s) > target:
+            lo = mid
+        else:
+            hi = mid
+    t_abs = 0.5 * (lo + hi)
+    return t_abs - t_peak_s, t_abs
+
+
+def _component_timing_from_g_values(
+    g0: float,
+    g1: float,
+    dt_s: float,
+) -> tuple[float, float]:
+    r1, r2 = _roots_from_g(g0, g1)
+    tau1_s = _tau_from_root(r1, dt_s)
+    tau2_s = _tau_from_root(r2, dt_s)
+    tau_fast_s = min(tau1_s, tau2_s)
+    tau_slow_s = max(tau1_s, tau2_s)
+    t_peak_s = _t_peak_continuous(tau_fast_s, tau_slow_s)
+    t_half_after_peak_s, _ = _half_decay_after_peak_continuous(
+        tau_fast_s,
+        tau_slow_s,
+        t_peak_s,
+    )
+    return 1000.0 * t_peak_s, 1000.0 * t_half_after_peak_s
+
+
+def _component_timing_arrays_from_g_matrix(
+    g_matrix: np.ndarray,
+    dt_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    n_components = int(g_matrix.shape[0])
+    t_peak = np.full(n_components, np.nan, dtype=np.float64)
+    t_half = np.full(n_components, np.nan, dtype=np.float64)
+    if g_matrix.shape[1] < 2:
+        return t_peak, t_half
+
+    for component_index in range(n_components):
+        g0 = float(g_matrix[component_index, 0])
+        g1 = float(g_matrix[component_index, 1])
+        if not (np.isfinite(g0) and np.isfinite(g1)):
+            continue
+        try:
+            t_peak_value, t_half_value = _component_timing_from_g_values(g0, g1, dt_s)
+        except (ValueError, RuntimeError):
+            continue
+        t_peak[component_index] = float(t_peak_value)
+        t_half[component_index] = float(t_half_value)
+    return t_peak, t_half
+
+
+def profile_has_required_fields(profile_path: Path) -> bool:
+    if not profile_path.is_file():
+        return False
+    with profile_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+    if header is None:
+        return False
+    required_fields = {"component_index", *QUALITY_PROFILE_KEYS}
+    return required_fields.issubset(set(header))
+
+
 def save_neuron_profile_csv(
     cnm: cnmf.CNMF,
     movie_path: Path,
@@ -522,6 +661,8 @@ def save_neuron_profile_csv(
         "lam",
         "neurons_sn",
         *g_fieldnames,
+        "t_peak",
+        "t_half",
         "r_value_unreliable_joint_only",
     ]
 
@@ -555,6 +696,11 @@ def save_neuron_profile_csv(
     neurons_sn = _component_float_vector(
         getattr(estimates, "neurons_sn", None), n_components
     )
+    frame_rate_hz = float(cnm.params.get("data", "fr"))
+    t_peak, t_half = _component_timing_arrays_from_g_matrix(
+        g_matrix=g_matrix,
+        dt_s=1.0 / frame_rate_hz,
+    )
 
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     with profile_path.open("w", newline="", encoding="utf-8") as f:
@@ -568,6 +714,8 @@ def save_neuron_profile_csv(
                 "bl": float(bl[component_index]),
                 "lam": float(lam[component_index]),
                 "neurons_sn": float(neurons_sn[component_index]),
+                "t_peak": float(t_peak[component_index]),
+                "t_half": float(t_half[component_index]),
                 "r_value_unreliable_joint_only": bool(
                     r_value_unreliable[component_index]
                 ),
@@ -609,6 +757,35 @@ def _load_profile_metric_arrays(extract_dir: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
+def _load_extract_stats_payload(extract_dir: Path) -> dict[str, Any]:
+    stats_path = get_stats_path(extract_dir)
+    if not stats_path.is_file():
+        raise FileNotFoundError(f"Missing extract stats JSON: {stats_path}")
+    payload = json.loads(stats_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected dict payload in {stats_path}, got {type(payload).__name__}")
+    return payload
+
+
+def _load_metric_fit_override_from_stats(
+    stats_payload: dict[str, Any] | None,
+    spec: QualityMetricSpec,
+) -> dict[str, float | str] | None:
+    if stats_payload is None or spec.scale == "boolean":
+        return None
+    raw_stats = stats_payload.get(spec.key)
+    if not isinstance(raw_stats, dict):
+        return None
+    try:
+        return {
+            "scale": str(raw_stats["scale"]),
+            "mean": float(raw_stats["mean"]),
+            "std": float(raw_stats["std"]),
+        }
+    except Exception:
+        return None
+
+
 def write_extract_stats_json(extract_dir: Path, logger: logging.Logger) -> None:
     metric_arrays = _load_profile_metric_arrays(extract_dir)
     payload: dict[str, Any] = {}
@@ -630,40 +807,58 @@ def write_extract_stats_json(extract_dir: Path, logger: logging.Logger) -> None:
         payload[spec.key] = metric_payload
 
     stats_path = get_stats_path(extract_dir)
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
     with stats_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     logger.info("Saved extract stats to %s", stats_path)
 
 
-def render_extract_stats_png(extract_dir: Path, logger: logging.Logger) -> None:
+def render_extract_stats_png(
+    extract_dir: Path,
+    logger: logging.Logger,
+    progress_bar: tqdm.tqdm | None = None,
+) -> None:
     metric_arrays = _load_profile_metric_arrays(extract_dir)
+    stats_payload = _load_extract_stats_payload(extract_dir)
     continuous_specs = tuple(spec for spec in QUALITY_METRIC_SPECS if spec.scale != "boolean")
-    titles = {
-        "snr": "SNR",
-        "r_value": "R Value",
-        "bl": "BL",
-        "lam": "Lambda",
-        "neurons_sn": "Neurons SN",
-        "g_0": "g_0",
-        "g_1": "g_1",
+    x_labels = {
+        "t_peak": "t_peak (ms)",
+        "t_half": "t_1/2 (ms)",
     }
 
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10), constrained_layout=True)
-    axes = axes.ravel()
-
-    for ax, spec in zip(axes[: len(continuous_specs)], continuous_specs, strict=False):
+    for spec in continuous_specs:
         raw_values = np.asarray(metric_arrays[spec.key], dtype=np.float64)
         raw_values = raw_values[np.isfinite(raw_values)]
-        mapped_values, fit_mean, fit_std, meta = _fit_metric_distribution(spec, raw_values)
+        fit_override = _load_metric_fit_override_from_stats(stats_payload, spec)
+        mapped_values, fit_mean, fit_std, meta = _fit_metric_distribution(
+            spec,
+            raw_values,
+            fit_override=fit_override,
+        )
+        histogram_values = mapped_values
+        if str(meta["scale"]) == "log":
+            positive_mask = raw_values > 0.0
+            if np.any(positive_mask):
+                histogram_values = np.log10(raw_values[positive_mask])
+            display_floor = fit_mean - 4.0 * fit_std
+            histogram_values = histogram_values[histogram_values >= display_floor]
+            if histogram_values.size == 0:
+                histogram_values = mapped_values
         metric_norm = mcolors.TwoSlopeNorm(
             vmin=fit_mean - 3.0 * fit_std,
             vcenter=fit_mean,
             vmax=fit_mean + 3.0 * fit_std,
         )
         metric_cmap = _resolve_metric_cmap(spec.cmap)
+        fig, ax = plt.subplots(
+            1,
+            1,
+            figsize=QUALITY_STATUS_FIGURE_SIZE,
+            constrained_layout=True,
+        )
 
         _, bin_edges, patches = ax.hist(
-            mapped_values,
+            histogram_values,
             bins=80,
             density=True,
             edgecolor="white",
@@ -673,8 +868,8 @@ def render_extract_stats_png(extract_dir: Path, logger: logging.Logger) -> None:
         for patch, center in zip(patches, bin_centers, strict=False):
             patch.set_facecolor(metric_cmap(metric_norm(center)))
 
-        x_min = min(float(np.min(mapped_values)), fit_mean - 4.0 * fit_std)
-        x_max = max(float(np.max(mapped_values)), fit_mean + 4.0 * fit_std)
+        x_min = min(float(np.min(histogram_values)), fit_mean - 4.0 * fit_std)
+        x_max = max(float(np.max(histogram_values)), fit_mean + 4.0 * fit_std)
         xs = np.linspace(x_min, x_max, 1000)
         pdf = scipy_norm.pdf(xs, loc=fit_mean, scale=fit_std)
         ax.plot(xs, pdf, color="black", linewidth=2.0)
@@ -683,19 +878,19 @@ def render_extract_stats_png(extract_dir: Path, logger: logging.Logger) -> None:
             ax.axvline(fit_mean - k * fit_std, color="black", linestyle="--", linewidth=1.0)
             ax.axvline(fit_mean + k * fit_std, color="black", linestyle="--", linewidth=1.0)
 
-        title_suffix = " (log10 fit)" if str(meta["scale"]) == "log" else " (linear)"
-        x_label = f"log10({spec.key})" if str(meta["scale"]) == "log" else spec.key
-        ax.set_title(f"{titles[spec.key]}{title_suffix}")
+        x_label = (
+            f"log10({spec.key})"
+            if str(meta["scale"]) == "log"
+            else x_labels.get(spec.key, spec.key)
+        )
         ax.set_xlabel(x_label)
         ax.set_ylabel("Density")
-
-    for ax in axes[len(continuous_specs):]:
-        ax.axis("off")
-
-    out_path = get_stats_png_path(extract_dir)
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-    logger.info("Saved extract stats plot to %s", out_path)
+        out_path = get_stats_metric_png_path(extract_dir, spec.key)
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        logger.info("Saved extract stats plot to %s", out_path)
+        if progress_bar is not None:
+            progress_bar.update(1)
 
 
 def get_quality_render_output_paths(extract_dir: Path) -> dict[str, Path]:
@@ -710,20 +905,6 @@ def get_quality_render_output_paths(extract_dir: Path) -> dict[str, Path]:
         paths[f"{spec.slug}_dots_labeled"] = point_label_dir / f"{spec.key}.tif"
         paths[f"{spec.slug}_threshold"] = threshold_dir / f"{spec.key}.tif"
     return paths
-
-
-def remove_legacy_quality_render_outputs(extract_dir: Path) -> None:
-    for figure_dir in (
-        get_figure_spatialmap_dir(extract_dir),
-        get_figure_pointmap_dir(extract_dir),
-        get_figure_pointmap_label_dir(extract_dir),
-        get_figure_thresholdstack_dir(extract_dir),
-    ):
-        if not figure_dir.is_dir():
-            continue
-        for path in figure_dir.iterdir():
-            if path.is_file():
-                path.unlink()
 
 
 def _component_core_coordinates_and_weights(spatial, patch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -999,6 +1180,7 @@ def _build_adaptive_multiscale_field(
 def _prepare_metric_space_values(
     spec: QualityMetricSpec,
     values: np.ndarray,
+    scale_override: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float | int | str]]:
     arr = np.asarray(values, dtype=np.float64)
     finite_mask = np.isfinite(arr)
@@ -1006,11 +1188,12 @@ def _prepare_metric_space_values(
     if finite.size == 0:
         raise RuntimeError(f"No finite values available for metric transform: {spec.key}")
 
-    meta: dict[str, float | int | str] = {"scale": spec.scale}
-    if spec.scale == "linear":
+    scale = str(spec.scale if scale_override is None else scale_override)
+    meta: dict[str, float | int | str] = {"scale": scale}
+    if scale == "linear":
         return arr.copy(), finite.astype(np.float64, copy=False), meta
 
-    if spec.scale == "log":
+    if scale == "log":
         positive = finite[finite > 0]
         if positive.size == 0:
             raise RuntimeError(
@@ -1025,17 +1208,34 @@ def _prepare_metric_space_values(
         meta["nonpositive_count"] = int(np.count_nonzero(finite <= 0))
         return transformed, transformed[np.isfinite(transformed)], meta
 
-    raise ValueError(f"Unsupported metric render scale: {spec.scale}")
+    raise ValueError(f"Unsupported metric render scale: {scale}")
 
 
 def _fit_metric_distribution(
     spec: QualityMetricSpec,
     values: np.ndarray,
+    fit_override: dict[str, float | str] | None = None,
 ) -> tuple[np.ndarray, float, float, dict[str, float | int | str]]:
-    metric_space_values, fit_values, meta = _prepare_metric_space_values(spec, values)
-    fit_mean, fit_std = scipy_norm.fit(fit_values.astype(np.float64, copy=False))
-    fit_mean = float(fit_mean)
-    fit_std = float(fit_std)
+    scale_override = None
+    if fit_override is not None:
+        scale_override = str(fit_override["scale"])
+    metric_space_values, fit_values, meta = _prepare_metric_space_values(
+        spec,
+        values,
+        scale_override=scale_override,
+    )
+    if fit_override is None:
+        if str(meta["scale"]) == "log":
+            raw_values = np.asarray(values, dtype=np.float64)
+            positive_mask = np.isfinite(raw_values) & (raw_values > 0.0)
+            if np.any(positive_mask):
+                fit_values = np.log10(raw_values[positive_mask])
+        fit_mean, fit_std = scipy_norm.fit(fit_values.astype(np.float64, copy=False))
+        fit_mean = float(fit_mean)
+        fit_std = float(fit_std)
+    else:
+        fit_mean = float(fit_override["mean"])
+        fit_std = float(fit_override["std"])
     if not np.isfinite(fit_std) or fit_std <= 0.0:
         fit_std = 1.0
     if np.any(~np.isfinite(metric_space_values)):
@@ -1056,12 +1256,17 @@ def _build_boolean_metric_render_values(
 def _build_metric_render_values(
     spec: QualityMetricSpec,
     values: np.ndarray,
+    fit_override: dict[str, float | str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, mcolors.Normalize, float, float, dict[str, float | int | str]]:
     if spec.scale == "boolean":
         binary, render_values, norm = _build_boolean_metric_render_values(values)
         return binary, render_values, norm, 0.5, 0.5, {"scale": spec.scale}
 
-    metric_space_values, fit_mean, fit_std, meta = _fit_metric_distribution(spec, values)
+    metric_space_values, fit_mean, fit_std, meta = _fit_metric_distribution(
+        spec,
+        values,
+        fit_override=fit_override,
+    )
     half = float(QUALITY_GAUSSIAN_DISPLAY_SIGMA_RANGE * fit_std)
     vmin = float(fit_mean - half)
     vmax = float(fit_mean + half)
@@ -1140,7 +1345,11 @@ def _build_threshold_stack_labels(
             else fit_mean + float(z_thr) * fit_std
         )
         op = ">" if bad_is_high else "<"
-        labels.append(f"reject: value {op} {_format_threshold_value(metric_thr)}")
+        if spec.key in {"t_peak", "t_half"}:
+            threshold_text = f"{metric_thr:.1f}"
+        else:
+            threshold_text = _format_threshold_value(metric_thr)
+        labels.append(f"reject: value {op} {threshold_text}")
     return labels
 
 
@@ -1172,6 +1381,9 @@ def _format_metric_label_texts(
     labels: list[str] = []
     for value in values:
         v = float(value)
+        if spec.key in {"t_peak", "t_half"}:
+            labels.append(f"{v:.1f}")
+            continue
         abs_v = abs(v)
         if abs_v >= 100.0 or (0.0 < abs_v < 0.01):
             labels.append(f"{v:.2e}")
@@ -1259,6 +1471,177 @@ def _render_metric_spatial_map_tif(
     tifffile.imwrite(out_path, rgb, photometric="rgb")
 
 
+def _render_autoregressive_demo_png(
+    extract_dir: Path,
+    frame_rate_hz: float,
+    logger: logging.Logger,
+) -> None:
+    metric_arrays = _load_profile_metric_arrays(extract_dir)
+    g0_values = np.asarray(metric_arrays["g_0"], dtype=np.float64)
+    g1_values = np.asarray(metric_arrays["g_1"], dtype=np.float64)
+    t_peak_values = np.asarray(metric_arrays["t_peak"], dtype=np.float64)
+    t_half_values = np.asarray(metric_arrays["t_half"], dtype=np.float64)
+
+    finite_mask = (
+        np.isfinite(g0_values)
+        & np.isfinite(g1_values)
+        & np.isfinite(t_peak_values)
+        & np.isfinite(t_half_values)
+    )
+    if not np.any(finite_mask):
+        raise RuntimeError("No finite autoregressive timing values were available.")
+
+    g0_values = g0_values[finite_mask]
+    g1_values = g1_values[finite_mask]
+    t_peak_values = t_peak_values[finite_mask]
+    t_half_values = t_half_values[finite_mask]
+
+    g0_mean = float(np.mean(g0_values))
+    g1_mean = float(np.mean(g1_values))
+    dt_s = 1.0 / float(frame_rate_hz)
+    t_s = np.linspace(0.0, 8.0, 8001, dtype=np.float64)
+    t_bg_s = np.linspace(0.0, 3.0, 601, dtype=np.float32)
+
+    r1, r2 = _roots_from_g(g0_mean, g1_mean)
+    tau1_s = _tau_from_root(r1, dt_s)
+    tau2_s = _tau_from_root(r2, dt_s)
+    tau_fast_s = min(tau1_s, tau2_s)
+    tau_slow_s = max(tau1_s, tau2_s)
+    t_peak_s = _t_peak_continuous(tau_fast_s, tau_slow_s)
+    t_half_after_peak_s, t_half_abs_s = _half_decay_after_peak_continuous(
+        tau_fast_s,
+        tau_slow_s,
+        t_peak_s,
+    )
+    y = _continuous_kernel_shape(t_s, tau_fast_s, tau_slow_s)
+
+    background_segments: list[np.ndarray] = []
+    x_bg_ms = t_bg_s * 1000.0
+    for g0, g1 in zip(g0_values, g1_values, strict=False):
+        try:
+            r_bg_1, r_bg_2 = _roots_from_g(float(g0), float(g1))
+            tau_bg_1 = _tau_from_root(r_bg_1, dt_s)
+            tau_bg_2 = _tau_from_root(r_bg_2, dt_s)
+            tau_bg_fast = min(tau_bg_1, tau_bg_2)
+            tau_bg_slow = max(tau_bg_1, tau_bg_2)
+            y_bg = _continuous_kernel_shape(
+                t_bg_s.astype(np.float64),
+                tau_bg_fast,
+                tau_bg_slow,
+            ).astype(np.float32)
+        except (ValueError, RuntimeError):
+            continue
+        background_segments.append(
+            np.column_stack((x_bg_ms, y_bg)).astype(np.float32, copy=False)
+        )
+    if not background_segments:
+        raise RuntimeError("No valid autoregressive background traces were available.")
+
+    direct_t_peak_mean_s = float(np.mean(t_peak_values) / 1000.0)
+    direct_t_half_mean_s = float(np.mean(t_half_values) / 1000.0)
+    t_peak_ms = t_peak_s * 1000.0
+    t_half_ms = t_half_abs_s * 1000.0
+    direct_t_peak_ms = direct_t_peak_mean_s * 1000.0
+    direct_t_half_abs_ms = (direct_t_peak_mean_s + direct_t_half_mean_s) * 1000.0
+
+    fig, ax = plt.subplots(figsize=(9, 5.5), constrained_layout=True)
+    background_collection = matplotlib.collections.LineCollection(
+        background_segments,
+        colors=AUTOREGRESSIVE_BACKGROUND_TRACE_RGBA,
+        linewidths=0.35,
+        zorder=1,
+        rasterized=True,
+    )
+    ax.add_collection(background_collection)
+    ax.plot(t_s * 1000.0, y, color=AUTOREGRESSIVE_MAIN_TRACE_COLOR, linewidth=2.7, zorder=2)
+    ax.axvline(t_peak_ms, color=AUTOREGRESSIVE_MAIN_TRACE_COLOR, linestyle="--", linewidth=1.2)
+    ax.axvline(t_half_ms, color=AUTOREGRESSIVE_MAIN_TRACE_COLOR, linestyle="--", linewidth=1.2)
+    ax.axvline(
+        direct_t_peak_ms,
+        color=AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR,
+        linestyle="-.",
+        linewidth=1.1,
+    )
+    ax.axvline(
+        direct_t_half_abs_ms,
+        color=AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR,
+        linestyle="-.",
+        linewidth=1.1,
+    )
+    ax.axhline(0.5, color="#2B2B2B", linestyle=":", linewidth=1.0)
+    ax.scatter(
+        [t_peak_ms, t_half_ms],
+        [1.0, 0.5],
+        color=[AUTOREGRESSIVE_MAIN_TRACE_COLOR, AUTOREGRESSIVE_MAIN_TRACE_COLOR],
+        s=28,
+        zorder=3,
+    )
+    ax.scatter(
+        [direct_t_peak_ms, direct_t_half_abs_ms],
+        [1.0, 0.5],
+        color=[
+            AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR,
+            AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR,
+        ],
+        s=24,
+        zorder=3,
+    )
+
+    right_x = max(t_half_ms, direct_t_half_abs_ms) + 130.0
+    ax.annotate(
+        f"t_peak = {t_peak_ms:.1f} ms",
+        xy=(t_peak_ms, 1.0),
+        xytext=(right_x, 0.93),
+        arrowprops={"arrowstyle": "->", "lw": 1.0, "color": AUTOREGRESSIVE_MAIN_TRACE_COLOR},
+        fontsize=10,
+        color=AUTOREGRESSIVE_MAIN_TRACE_COLOR,
+    )
+    ax.annotate(
+        f"t_peak = {direct_t_peak_ms:.1f} ms",
+        xy=(direct_t_peak_ms, 1.0),
+        xytext=(right_x, 0.81),
+        arrowprops={
+            "arrowstyle": "->",
+            "lw": 1.0,
+            "color": AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR,
+        },
+        fontsize=10,
+        color=AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR,
+    )
+    ax.annotate(
+        f"t_1/2 = {t_half_after_peak_s * 1000.0:.1f} ms",
+        xy=(t_half_ms, 0.5),
+        xytext=(right_x, 0.67),
+        arrowprops={"arrowstyle": "->", "lw": 1.0, "color": AUTOREGRESSIVE_MAIN_TRACE_COLOR},
+        fontsize=10,
+        color=AUTOREGRESSIVE_MAIN_TRACE_COLOR,
+    )
+    ax.annotate(
+        f"t_1/2 = {direct_t_half_mean_s * 1000.0:.1f} ms",
+        xy=(direct_t_half_abs_ms, 0.5),
+        xytext=(right_x, 0.55),
+        arrowprops={
+            "arrowstyle": "->",
+            "lw": 1.0,
+            "color": AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR,
+        },
+        fontsize=10,
+        color=AUTOREGRESSIVE_BACKGROUND_ANNOTATION_COLOR,
+    )
+
+    ax.set_xlim(0.0, 3000.0)
+    ax.set_ylim(-0.02, 1.08)
+    ax.set_xlabel("Time After One Spike (ms)")
+    ax.set_ylabel("Peak-Normalized Response")
+    ax.grid(color=AUTOREGRESSIVE_GRID_COLOR, alpha=0.55, linewidth=0.6)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    out_path = get_autoregressive_png_path(extract_dir)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    logger.info("Saved autoregressive demo plot to %s", out_path)
+
+
 def render_extract_quality_outputs(
     y_load_fold_cfg: Any,
     movie_paths: list[Path],
@@ -1273,7 +1656,6 @@ def render_extract_quality_outputs(
     get_figure_pointmap_dir(extract_dir).mkdir(parents=True, exist_ok=True)
     get_figure_pointmap_label_dir(extract_dir).mkdir(parents=True, exist_ok=True)
     get_figure_thresholdstack_dir(extract_dir).mkdir(parents=True, exist_ok=True)
-    remove_legacy_quality_render_outputs(extract_dir)
     output_paths = get_quality_render_output_paths(extract_dir)
     patches, full_h, full_w = _prepare_quality_render_patches(
         y_load_fold_cfg=y_load_fold_cfg,
@@ -1283,6 +1665,7 @@ def render_extract_quality_outputs(
     components = _collect_quality_render_components(patches, extract_dir)
     if not components:
         raise RuntimeError("No component points were available for extract quality rendering.")
+    stats_payload = _load_extract_stats_payload(extract_dir)
 
     xs = np.asarray([component.x for component in components], dtype=np.float64)
     ys = np.asarray([component.y for component in components], dtype=np.float64)
@@ -1293,9 +1676,11 @@ def render_extract_quality_outputs(
             [component.metrics[spec.key] for component in components],
             dtype=np.float64,
         )
+        fit_override = _load_metric_fit_override_from_stats(stats_payload, spec)
         metric_space_values, display_values, norm, fit_mean, fit_std, meta = _build_metric_render_values(
             spec,
             metric_values,
+            fit_override=fit_override,
         )
         field = _build_adaptive_multiscale_field(
             xs=xs,
@@ -1412,6 +1797,7 @@ class Extract:
         extract_dir.mkdir(parents=True, exist_ok=True)
         get_model_dir(extract_dir).mkdir(parents=True, exist_ok=True)
         get_profile_dir(extract_dir).mkdir(parents=True, exist_ok=True)
+        get_stats_dir(extract_dir).mkdir(parents=True, exist_ok=True)
         get_figure_spatialmap_dir(extract_dir).mkdir(parents=True, exist_ok=True)
         get_figure_pointmap_dir(extract_dir).mkdir(parents=True, exist_ok=True)
         get_figure_pointmap_label_dir(extract_dir).mkdir(parents=True, exist_ok=True)
@@ -1431,10 +1817,10 @@ class Extract:
             model_path = get_model_path(movie_path, extract_dir)
             profile_path = get_profile_csv_path(movie_path, extract_dir)
             need_model = not model_path.is_file()
-            need_profile = need_model or not profile_path.is_file()
+            need_profile = need_model or not profile_has_required_fields(profile_path)
             if model_path.is_file():
                 model_done_count += 1
-            if profile_path.is_file():
+            if profile_has_required_fields(profile_path):
                 profile_done_count += 1
             if not need_model and not need_profile:
                 continue
@@ -1511,7 +1897,11 @@ class Extract:
                     caiman.stop_server(dview=dview)
             model_bar.close()
             profile_bar.close()
-        figure_total = len(get_quality_render_output_paths(extract_dir)) + 1
+        figure_total = (
+            len(get_quality_render_output_paths(extract_dir))
+            + len(tuple(spec for spec in QUALITY_METRIC_SPECS if spec.scale != "boolean"))
+            + 1
+        )
         figure_bar = tqdm.tqdm(
             total=figure_total,
             desc="extract(figure)",
@@ -1519,6 +1909,7 @@ class Extract:
             position=0,
         )
         try:
+            write_extract_stats_json(extract_dir, logger)
             render_extract_quality_outputs(
                 y_load_fold_cfg=self.cfg.extract.y_load_fold,
                 movie_paths=movie_paths,
@@ -1526,8 +1917,16 @@ class Extract:
                 logger=logger,
                 progress_bar=figure_bar,
             )
-            write_extract_stats_json(extract_dir, logger)
-            render_extract_stats_png(extract_dir, logger)
+            render_extract_stats_png(
+                extract_dir,
+                logger,
+                progress_bar=figure_bar,
+            )
+            _render_autoregressive_demo_png(
+                extract_dir=extract_dir,
+                frame_rate_hz=float(self.cfg.data.fr),
+                logger=logger,
+            )
             figure_bar.update(1)
         finally:
             figure_bar.close()

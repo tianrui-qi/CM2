@@ -3,13 +3,13 @@ save:
   x_load_path: ???
   y_load_path: ???
   crop_load_path: ???
-  extract_load_fold: ???
+  extract_fold: ???
   save_fold: ???
   # enable
   extract2d: true
   extract3d: false
   # threshold
-  t_snr: [null, 3.5]
-  t_r_value: [-0.3, null]
-  t_lam: [-1.0, null]
-  t_neurons_sn: [-0.6, null]
+  t_snr: [-2.0, 3.0]
+  t_r_value: [-0.0, null]
+  t_lam: [-1.0, 2.0]
+  t_neurons_sn: [-1.0, 2.0]

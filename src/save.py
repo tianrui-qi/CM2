@@ -9,6 +9,7 @@ import re
 import shutil
 
 import numpy as np
+from scipy import fft as scipy_fft
 import tifffile
 import tqdm
 import zarr
@@ -31,6 +32,14 @@ MODEL_OUTPUT_ORDER = (
 )
 LEGACY_TEMP_OUTPUT_DIRS = ("A", "C", "YrA", "W", "Bc") + MODEL_OUTPUT_ORDER
 MODEL_BAR_LABEL_WIDTH = 5
+IMAGEJ_BANDPASS_FILTER_LARGE_DIAMETER_PX = 5.0
+IMAGEJ_BANDPASS_FILTER_SMALL_DIAMETER_PX = 1.0
+POINTMAP_DIRNAME = "figure-PointMap"
+POINTMAP_LABEL_DIRNAME = "figure-PointMap-label"
+THRESHOLDSTACK_DIRNAME = "figure-ThresholdStack"
+OVERLAP_POINTMAP_DIRNAME = "overlap-PointMap"
+OVERLAP_POINTMAP_LABEL_DIRNAME = "overlap-PointMap-label"
+OVERLAP_THRESHOLDSTACK_DIRNAME = "overlap-ThresholdStack"
 
 
 @dataclass
@@ -87,7 +96,7 @@ def _model_file_to_patch_name(path: Path) -> str:
 
 def _resolve_patch_folders(
     y_load_path: Path,
-    extract_load_fold_cfg: str | None,
+    extract_fold_cfg: str | None,
 ) -> tuple[Path, Path]:
     y_load_fold = y_load_path.with_suffix("")
     if not y_load_fold.is_dir():
@@ -99,29 +108,31 @@ def _resolve_patch_folders(
                 f"Patch movie folder not found. Tried: {y_load_fold} and {fallback}"
             )
 
-    extract_load_fold = (
+    extract_fold = (
         y_load_path.parent / "extract"
-        if extract_load_fold_cfg is None
-        else Path(extract_load_fold_cfg)
+        if extract_fold_cfg is None
+        else Path(extract_fold_cfg)
     )
-    if not extract_load_fold.is_dir():
+    if not extract_fold.is_dir():
         raise NotADirectoryError(
-            f"extract_load_fold must be an existing directory: {extract_load_fold}"
+            f"extract_fold must be an existing directory: {extract_fold}"
         )
-    model_dir = extract_load_fold / "model"
-    if model_dir.is_dir():
-        return y_load_fold, model_dir
-    return y_load_fold, extract_load_fold
+    model_dir = extract_fold / "patch-model"
+    if not model_dir.is_dir():
+        raise NotADirectoryError(
+            f"extract_fold must contain a patch-model directory: {model_dir}"
+        )
+    return y_load_fold, model_dir
 
 
 def _collect_patch_meta(
     y_load_fold: Path,
-    extract_load_fold: Path,
+    extract_fold: Path,
 ) -> list[PatchMeta]:
     patches: list[PatchMeta] = []
-    model_files = sorted(extract_load_fold.glob("*.hdf5"), key=lambda p: p.name)
+    model_files = sorted(extract_fold.glob("*.hdf5"), key=lambda p: p.name)
     if not model_files:
-        raise FileNotFoundError(f"No .hdf5 model files found in: {extract_load_fold}")
+        raise FileNotFoundError(f"No .hdf5 model files found in: {extract_fold}")
 
     for model_path in model_files:
         patch_name = _model_file_to_patch_name(model_path)
@@ -158,7 +169,7 @@ def _collect_patch_meta(
 
 
 def _resolve_extract_root(model_dir_or_root: Path) -> Path:
-    if model_dir_or_root.name == "model":
+    if model_dir_or_root.name == "patch-model":
         return model_dir_or_root.parent
     return model_dir_or_root
 
@@ -222,7 +233,11 @@ def _load_qc_threshold_specs(
     if not enabled:
         return ()
 
-    stats_path = extract_root / "stats.json"
+    stats_path = extract_root / "stats" / "stats.json"
+    if not stats_path.is_file():
+        legacy_stats_path = extract_root / "stats.json"
+        if legacy_stats_path.is_file():
+            stats_path = legacy_stats_path
     if not stats_path.is_file():
         raise FileNotFoundError(
             f"QC thresholds require extract stats.json, but it was not found: {stats_path}"
@@ -297,6 +312,73 @@ def _read_patch_qc_keep_mask(
             f"csv_rows={seen}, n_components={n_components}"
         )
     return keep
+
+
+def _count_profile_qc_components(
+    profile_path: Path,
+    qc_threshold_specs: Sequence[QcThresholdSpec],
+) -> tuple[int, int]:
+    if not profile_path.is_file():
+        raise FileNotFoundError(f"Missing profile CSV for QC count: {profile_path}")
+
+    total = 0
+    kept = 0
+    with profile_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            total += 1
+            keep_value = True
+            for spec in qc_threshold_specs:
+                metric_space_value = _metric_to_qc_space(
+                    raw_value=float(row[spec.key]),
+                    scale=spec.scale,
+                )
+                z_value = (metric_space_value - spec.mean) / spec.std
+                if spec.lower_z is not None and z_value < spec.lower_z:
+                    keep_value = False
+                    break
+                if spec.upper_z is not None and z_value > spec.upper_z:
+                    keep_value = False
+                    break
+            if keep_value:
+                kept += 1
+    return total, kept
+
+
+def _summarize_qc_component_counts(
+    extract_root: Path,
+    t_snr: Sequence[float | None] | None,
+    t_r_value: Sequence[float | None] | None,
+    t_lam: Sequence[float | None] | None,
+    t_neurons_sn: Sequence[float | None] | None,
+) -> tuple[int, int] | None:
+    profile_dir = extract_root / "patch-profile"
+    if not profile_dir.is_dir():
+        return None
+
+    qc_threshold_specs = _load_qc_threshold_specs(
+        extract_root=extract_root,
+        t_snr=t_snr,
+        t_r_value=t_r_value,
+        t_lam=t_lam,
+        t_neurons_sn=t_neurons_sn,
+    )
+
+    profile_paths = sorted(
+        path
+        for path in profile_dir.glob("*.tif.csv")
+        if not path.name.startswith("._")
+    )
+    total_before = 0
+    total_after = 0
+    for profile_path in profile_paths:
+        total, kept = _count_profile_qc_components(
+            profile_path=profile_path,
+            qc_threshold_specs=qc_threshold_specs,
+        )
+        total_before += total
+        total_after += kept
+    return total_before, total_after
 
 
 def _compute_patch_layout(
@@ -544,6 +626,324 @@ def _choose_stats_chunk(
 
     max_chunk = max(1, int(working_budget // max(1, per_frame_scratch_bytes)))
     return max(1, min(t, max_chunk)), True
+
+
+def _read_tiff(path: Path) -> np.ndarray:
+    return tifffile.imread(str(path))
+
+
+def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image)
+    if arr.dtype == np.uint8:
+        return arr
+    if arr.dtype == np.uint16:
+        return np.round(arr.astype(np.float32) / 257.0).astype(np.uint8)
+    arr = arr.astype(np.float32, copy=False)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    lo = float(np.percentile(finite, 1.0))
+    hi = float(np.percentile(finite, 99.5))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.min(finite))
+        hi = float(np.max(finite))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    scaled = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    return np.round(scaled * 255.0).astype(np.uint8)
+
+
+def _imagej_auto_display_range_once(image: np.ndarray) -> tuple[float, float]:
+    arr = np.asarray(image, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0, 0.0
+
+    hist_min = float(np.min(finite))
+    hist_max = float(np.max(finite))
+    if not np.isfinite(hist_min) or not np.isfinite(hist_max) or hist_max <= hist_min:
+        return hist_min, hist_max
+
+    histogram, _ = np.histogram(finite, bins=256, range=(hist_min, hist_max))
+    pixel_count = int(finite.size)
+    limit = pixel_count // 10
+    threshold = pixel_count // 5000
+
+    i = -1
+    found = False
+    while (not found) and (i < 255):
+        i += 1
+        count = int(histogram[i])
+        if count > limit:
+            count = 0
+        found = count > threshold
+    hmin = i
+
+    i = 256
+    found = False
+    while (not found) and (i > 0):
+        i -= 1
+        count = int(histogram[i])
+        if count > limit:
+            count = 0
+        found = count > threshold
+    hmax = i
+
+    if hmax < hmin:
+        return hist_min, hist_max
+
+    bin_size = (hist_max - hist_min) / 256.0
+    display_min = hist_min + hmin * bin_size
+    display_max = hist_min + hmax * bin_size
+    if display_max <= display_min:
+        return hist_min, hist_max
+    return float(display_min), float(display_max)
+
+
+def _normalize_to_uint8_imagej_auto(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    display_min, display_max = _imagej_auto_display_range_once(arr)
+    if not np.isfinite(display_min) or not np.isfinite(display_max) or display_max <= display_min:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    scaled = np.clip((arr - display_min) / (display_max - display_min), 0.0, 1.0)
+    return np.round(scaled * 255.0).astype(np.uint8)
+
+
+def _background_to_rgb_uint8(background: np.ndarray) -> np.ndarray:
+    if background.ndim == 2:
+        gray = _normalize_to_uint8_imagej_auto(background)
+        return np.repeat(gray[..., None], 3, axis=-1)
+    if background.ndim == 3 and background.shape[-1] in (3, 4):
+        rgb = background[..., :3]
+        if rgb.dtype == np.uint8:
+            return rgb
+        if rgb.dtype == np.uint16:
+            return np.round(rgb.astype(np.float32) / 257.0).astype(np.uint8)
+        channels = [
+            _normalize_to_uint8_imagej_auto(rgb[..., channel_idx])
+            for channel_idx in range(3)
+        ]
+        return np.stack(channels, axis=-1)
+    raise ValueError(
+        f"Background must be 2D grayscale or YXS RGB/RGBA, got shape={background.shape}"
+    )
+
+
+def _resize_nearest(image: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    src_h, src_w = int(image.shape[0]), int(image.shape[1])
+    if src_h == target_h and src_w == target_w:
+        return image
+    y_idx = np.minimum((np.arange(target_h, dtype=np.int64) * src_h) // target_h, src_h - 1)
+    x_idx = np.minimum((np.arange(target_w, dtype=np.int64) * src_w) // target_w, src_w - 1)
+    if image.ndim == 2:
+        return image[y_idx][:, x_idx]
+    if image.ndim == 3:
+        return image[y_idx][:, x_idx, :]
+    raise ValueError(f"Unsupported resize image ndim={image.ndim}")
+
+
+def _overlay_rgb(background_rgb: np.ndarray, foreground_rgb_uint8: np.ndarray) -> np.ndarray:
+    out = background_rgb.copy()
+    mask = np.any(foreground_rgb_uint8 != 0, axis=-1)
+    out[mask] = foreground_rgb_uint8[mask]
+    return out
+
+
+def _overlay_stack(background_rgb: np.ndarray, foreground_stack_uint8: np.ndarray) -> np.ndarray:
+    out = np.repeat(background_rgb[None, ...], foreground_stack_uint8.shape[0], axis=0)
+    mask = np.any(foreground_stack_uint8 != 0, axis=-1)
+    out[mask] = foreground_stack_uint8[mask]
+    return out
+
+
+def _list_metric_tifs(folder: Path) -> list[Path]:
+    return sorted(
+        [path for path in folder.glob("*.tif") if path.is_file() and not path.name.startswith("._")]
+    )
+
+
+def _prepare_output_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _overlay_folder(
+    source_dir: Path,
+    output_dir: Path,
+    background_rgb_base: np.ndarray,
+    preserve_labels: bool,
+    progress_bar: tqdm.tqdm | None = None,
+) -> None:
+    _prepare_output_dir(output_dir)
+    for source_path in _list_metric_tifs(source_dir):
+        with tifffile.TiffFile(source_path) as tif:
+            foreground = tif.asarray()
+            labels = None
+            if preserve_labels:
+                imagej_meta = tif.imagej_metadata or {}
+                labels = imagej_meta.get("Labels")
+
+        if foreground.ndim == 3 and foreground.shape[-1] == 3:
+            target_h, target_w = int(foreground.shape[0]), int(foreground.shape[1])
+            background_rgb = _resize_nearest(background_rgb_base, target_h, target_w)
+            out = _overlay_rgb(background_rgb, foreground)
+            tifffile.imwrite(output_dir / source_path.name, out, photometric="rgb")
+            if progress_bar is not None:
+                progress_bar.update(1)
+            continue
+
+        if foreground.ndim == 4 and foreground.shape[-1] == 3:
+            target_h, target_w = int(foreground.shape[1]), int(foreground.shape[2])
+            background_rgb = _resize_nearest(background_rgb_base, target_h, target_w)
+            out = _overlay_stack(background_rgb, foreground)
+            if labels is not None and len(labels) == int(out.shape[0]):
+                tifffile.imwrite(
+                    output_dir / source_path.name,
+                    out,
+                    imagej=True,
+                    photometric="rgb",
+                    metadata={"Labels": labels},
+                )
+            else:
+                tifffile.imwrite(
+                    output_dir / source_path.name,
+                    out,
+                    imagej=True,
+                    photometric="rgb",
+                )
+            if progress_bar is not None:
+                progress_bar.update(1)
+            continue
+
+        raise ValueError(f"Unsupported foreground shape for {source_path}: {foreground.shape}")
+
+
+def save_overlap_outputs(
+    extract_root: Path,
+    background_path: Path,
+) -> None:
+    if not background_path.is_file():
+        raise FileNotFoundError(f"Background not found: {background_path}")
+    if not extract_root.is_dir():
+        raise NotADirectoryError(f"Extract folder not found: {extract_root}")
+
+    background = _read_tiff(background_path)
+    background_rgb_base = _background_to_rgb_uint8(background)
+
+    pointmap_dir = extract_root / POINTMAP_DIRNAME
+    pointmap_label_dir = extract_root / POINTMAP_LABEL_DIRNAME
+    thresholdstack_dir = extract_root / THRESHOLDSTACK_DIRNAME
+    for required_dir in (pointmap_dir, pointmap_label_dir, thresholdstack_dir):
+        if not required_dir.is_dir():
+            raise NotADirectoryError(f"Missing figure folder: {required_dir}")
+
+    total_figures = (
+        len(_list_metric_tifs(pointmap_dir))
+        + len(_list_metric_tifs(pointmap_label_dir))
+        + len(_list_metric_tifs(thresholdstack_dir))
+    )
+    with tqdm.tqdm(
+        total=total_figures,
+        desc="save(overlap)",
+        dynamic_ncols=True,
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
+        unit="figure",
+    ) as progress_bar:
+        _overlay_folder(
+            pointmap_dir,
+            extract_root / OVERLAP_POINTMAP_DIRNAME,
+            background_rgb_base,
+            preserve_labels=False,
+            progress_bar=progress_bar,
+        )
+        _overlay_folder(
+            pointmap_label_dir,
+            extract_root / OVERLAP_POINTMAP_LABEL_DIRNAME,
+            background_rgb_base,
+            preserve_labels=False,
+            progress_bar=progress_bar,
+        )
+        _overlay_folder(
+            thresholdstack_dir,
+            extract_root / OVERLAP_THRESHOLDSTACK_DIRNAME,
+            background_rgb_base,
+            preserve_labels=True,
+            progress_bar=progress_bar,
+        )
+
+
+def _next_power_of_two_at_least(value: float) -> int:
+    n = 2
+    while n < value:
+        n *= 2
+    return n
+
+
+def _reflect_indices(length: int, out_length: int, offset: int) -> np.ndarray:
+    coords = np.arange(out_length, dtype=np.int64) - int(offset)
+    period = 2 * int(length)
+    mirrored = np.mod(coords, period)
+    return np.where(mirrored < length, mirrored, period - 1 - mirrored).astype(np.int64)
+
+
+def _tile_mirror_imagej(image_yx: np.ndarray, padded_size: int) -> tuple[np.ndarray, int, int]:
+    h, w = image_yx.shape
+    x0 = int(round((padded_size - w) / 2.0))
+    y0 = int(round((padded_size - h) / 2.0))
+    xi = _reflect_indices(w, padded_size, x0)
+    yi = _reflect_indices(h, padded_size, y0)
+    return image_yx[yi][:, xi], x0, y0
+
+
+def _build_imagej_bandpass_filter(size: int) -> np.ndarray:
+    rows = np.minimum(
+        np.arange(size, dtype=np.float32),
+        size - np.arange(size, dtype=np.float32),
+    )
+    cols = np.arange(size // 2 + 1, dtype=np.float32)
+    scale_large = (2.0 * IMAGEJ_BANDPASS_FILTER_LARGE_DIAMETER_PX / float(size)) ** 2
+    scale_small = (2.0 * IMAGEJ_BANDPASS_FILTER_SMALL_DIAMETER_PX / float(size)) ** 2
+    radius_sq = rows[:, None] * rows[:, None] + cols[None, :] * cols[None, :]
+    bandpass = (1.0 - np.exp(-radius_sq * scale_large)) * np.exp(-radius_sq * scale_small)
+    # Match ImageJ FFTFilter.java: DC is preserved.
+    bandpass[0, 0] = 1.0
+    return bandpass.astype(np.float32, copy=False)
+
+
+def save_imagej_bandpass_tif(
+    input_path: Path,
+    output_path: Path,
+    progress_label: str | None = None,
+) -> None:
+    progress_bar = (
+        tqdm.tqdm(
+            total=1,
+            desc=f"save({progress_label})",
+            unit="image",
+            dynamic_ncols=True,
+        )
+        if progress_label is not None
+        else None
+    )
+    try:
+        image_yx = tifffile.imread(input_path).astype(np.float32, copy=False)
+        if image_yx.ndim != 2:
+            raise ValueError(f"Expected a single 2D TIFF for bandpass save, got shape={image_yx.shape}: {input_path}")
+
+        h, w = image_yx.shape
+        padded_size = _next_power_of_two_at_least(1.5 * max(h, w))
+        padded, x0, y0 = _tile_mirror_imagej(image_yx, padded_size)
+        bandpass = _build_imagej_bandpass_filter(padded_size)
+
+        spectrum = scipy_fft.rfft2(padded)
+        spectrum *= bandpass.astype(spectrum.real.dtype, copy=False)
+        filtered = scipy_fft.irfft2(spectrum, s=padded.shape).astype(np.float32, copy=False)
+        filtered = filtered[y0 : y0 + h, x0 : x0 + w]
+        tifffile.imwrite(output_path, filtered, photometric="minisblack")
+        if progress_bar is not None:
+            progress_bar.update(1)
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
 
 
 def _process_single_patch_into_outputs(
@@ -798,7 +1198,7 @@ def _process_single_patch_into_outputs(
                     ] = bf_core + bc_core[None, :, :]
 def save_model_products_stitched(
     y_load_path: Path,
-    extract_load_fold_cfg: str | None,
+    extract_fold_cfg: str | None,
     core_specs: dict[str, tuple[int, int, int, int]],
     save_dir: Path,
     t_snr: Sequence[float | None] | None,
@@ -807,12 +1207,12 @@ def save_model_products_stitched(
     t_neurons_sn: Sequence[float | None] | None,
     requested_output_names: Sequence[str] | None = None,
 ) -> None:
-    y_load_fold, extract_load_fold = _resolve_patch_folders(
+    y_load_fold, extract_fold = _resolve_patch_folders(
         y_load_path,
-        extract_load_fold_cfg,
+        extract_fold_cfg,
     )
-    extract_root = _resolve_extract_root(extract_load_fold)
-    profile_dir = extract_root / "profile"
+    extract_root = _resolve_extract_root(extract_fold)
+    profile_dir = extract_root / "patch-profile"
     qc_threshold_specs = _load_qc_threshold_specs(
         extract_root=extract_root,
         t_snr=t_snr,
@@ -820,7 +1220,7 @@ def save_model_products_stitched(
         t_lam=t_lam,
         t_neurons_sn=t_neurons_sn,
     )
-    patches = _collect_patch_meta(y_load_fold, extract_load_fold)
+    patches = _collect_patch_meta(y_load_fold, extract_fold)
     if not core_specs:
         raise ValueError("core_specs is empty; cannot stitch model products.")
     full_h = max(v[1] for v in core_specs.values())
@@ -972,17 +1372,21 @@ def save_time_mean_std_tif(
     std_out_path: Path,
     save_mean: bool = True,
     save_std: bool = True,
+    extra_output_labels: Sequence[str] | None = None,
 ) -> None:
     if not save_mean and not save_std:
         return
-    stats_label = ",".join(
+    stats_labels = [
         label
         for enabled, label in (
             (save_mean, mean_out_path.stem),
             (save_std, std_out_path.stem),
         )
         if enabled
-    )
+    ]
+    if extra_output_labels is not None:
+        stats_labels.extend(str(label) for label in extra_output_labels)
+    stats_label = ",".join(stats_labels)
 
     with tifffile.TiffFile(x_path) as tif:
         video = zarr.open(tif.aszarr(), mode="r")
@@ -1205,7 +1609,7 @@ def _format_model_bar_desc(name: str, direction: str) -> str:
 def run(
     x_load_path: str,
     y_load_path: str,
-    extract_load_fold: str | None,
+    extract_fold: str | None,
     save_fold: str | None,
     crop_load_path: str | None,
     t_snr: Sequence[float | None] | None,
@@ -1226,47 +1630,68 @@ def run(
     y_base = y_input_path.with_suffix("").name
     save_path_mean_x = plot_dir / f"{x_base}mean.tif"
     save_path_std_x = plot_dir / f"{x_base}std.tif"
+    save_path_bandpass_x = plot_dir / f"{x_base}bandpass.tif"
     save_path_mean_y = plot_dir / f"{y_base}mean.tif"
     save_path_std_y = plot_dir / f"{y_base}std.tif"
+    save_path_bandpass_y = plot_dir / f"{y_base}bandpass.tif"
 
     plot_dir.mkdir(parents=True, exist_ok=True)
-    resolved_extract_load_fold = (
+    resolved_extract_fold = (
         y_input_path.parent / "extract"
-        if extract_load_fold is None
-        else Path(extract_load_fold)
+        if extract_fold is None
+        else Path(extract_fold)
     )
-    should_save_model_products = resolved_extract_load_fold.is_dir()
+    should_save_model_products = resolved_extract_fold.is_dir()
 
-    if (
-        not _is_complete_file(save_path_mean_x)
-        or not _is_complete_file(save_path_std_x)
-    ):
-        need_mean_x = not _is_complete_file(save_path_mean_x)
-        need_std_x = not _is_complete_file(save_path_std_x)
+    need_mean_x = not _is_complete_file(save_path_mean_x)
+    need_std_x = not _is_complete_file(save_path_std_x)
+    need_bandpass_x = not _is_complete_file(save_path_bandpass_x)
+    if need_mean_x or need_std_x:
         save_time_mean_std_tif(
             x_path=input_path,
             mean_out_path=save_path_mean_x,
             std_out_path=save_path_std_x,
             save_mean=need_mean_x,
             save_std=need_std_x,
+            extra_output_labels=(save_path_bandpass_x.stem,) if need_bandpass_x else None,
+        )
+    if not _is_complete_file(save_path_bandpass_x):
+        if not _is_complete_file(save_path_std_x):
+            raise FileNotFoundError(
+                f"Cannot save bandpass image because std TIFF is missing or incomplete: {save_path_std_x}"
+            )
+        save_imagej_bandpass_tif(
+            input_path=save_path_std_x,
+            output_path=save_path_bandpass_x,
+            progress_label=None if (need_mean_x or need_std_x) else save_path_bandpass_x.stem,
         )
 
-    if (
-        not _is_complete_file(save_path_mean_y)
-        or not _is_complete_file(save_path_std_y)
-    ):
-        need_mean_y = not _is_complete_file(save_path_mean_y)
-        need_std_y = not _is_complete_file(save_path_std_y)
+    need_mean_y = not _is_complete_file(save_path_mean_y)
+    need_std_y = not _is_complete_file(save_path_std_y)
+    need_bandpass_y = not _is_complete_file(save_path_bandpass_y)
+    if need_mean_y or need_std_y:
         save_time_mean_std_tif(
             x_path=y_input_path,
             mean_out_path=save_path_mean_y,
             std_out_path=save_path_std_y,
             save_mean=need_mean_y,
             save_std=need_std_y,
+            extra_output_labels=(save_path_bandpass_y.stem,) if need_bandpass_y else None,
+        )
+    if not _is_complete_file(save_path_bandpass_y):
+        if not _is_complete_file(save_path_std_y):
+            raise FileNotFoundError(
+                f"Cannot save bandpass image because std TIFF is missing or incomplete: {save_path_std_y}"
+            )
+        save_imagej_bandpass_tif(
+            input_path=save_path_std_y,
+            output_path=save_path_bandpass_y,
+            progress_label=None if (need_mean_y or need_std_y) else save_path_bandpass_y.stem,
         )
 
     core_specs: dict[str, tuple[int, int, int, int]] | None = None
     if should_save_model_products:
+        extract_root = _resolve_extract_root(resolved_extract_fold)
         requested_2d_output_names = MODEL_2D_OUTPUT_ORDER if extract2d else ()
         requested_3d_output_names = MODEL_3D_OUTPUT_ORDER if extract3d else ()
         missing_2d_outputs = _get_missing_model_outputs(
@@ -1292,7 +1717,7 @@ def run(
             if missing_2d_outputs:
                 save_model_products_stitched(
                     y_load_path=y_input_path,
-                    extract_load_fold_cfg=str(resolved_extract_load_fold),
+                    extract_fold_cfg=str(resolved_extract_fold),
                     core_specs=core_specs,
                     save_dir=plot_dir,
                     t_snr=t_snr,
@@ -1305,7 +1730,7 @@ def run(
             if missing_3d_outputs:
                 save_model_products_stitched(
                     y_load_path=y_input_path,
-                    extract_load_fold_cfg=str(resolved_extract_load_fold),
+                    extract_fold_cfg=str(resolved_extract_fold),
                     core_specs=core_specs,
                     save_dir=plot_dir,
                     t_snr=t_snr,
@@ -1315,13 +1740,28 @@ def run(
                     requested_output_names=requested_3d_output_names,
                 )
 
+        qc_counts = _summarize_qc_component_counts(
+            extract_root=extract_root,
+            t_snr=t_snr,
+            t_r_value=t_r_value,
+            t_lam=t_lam,
+            t_neurons_sn=t_neurons_sn,
+        )
+        save_overlap_outputs(
+            extract_root=extract_root,
+            background_path=save_path_bandpass_y,
+        )
+        if qc_counts is not None:
+            before_qc, after_qc = qc_counts
+            print(f"beforeQC: {before_qc}, afterQC: {after_qc}")
+
 
 class Save:
     def __init__(
         self,
         x_load_path: str,
         y_load_path: str,
-        extract_load_fold: str | None,
+        extract_fold: str | None,
         save_fold: str | None,
         crop_load_path: str | None,
         t_snr: Sequence[float | None] | None,
@@ -1338,7 +1778,7 @@ class Save:
             raise TypeError(f"Unexpected save config keys: {unknown_keys}")
         self.x_load_path = x_load_path
         self.y_load_path = y_load_path
-        self.extract_load_fold = extract_load_fold
+        self.extract_fold = extract_fold
         self.save_fold = save_fold
         self.crop_load_path = crop_load_path
         self.t_snr = _normalize_qc_bounds(t_snr, "snr")
@@ -1352,7 +1792,7 @@ class Save:
         run(
             x_load_path=self.x_load_path,
             y_load_path=self.y_load_path,
-            extract_load_fold=self.extract_load_fold,
+            extract_fold=self.extract_fold,
             save_fold=self.save_fold,
             crop_load_path=self.crop_load_path,
             t_snr=self.t_snr,
