@@ -7,7 +7,6 @@ import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -195,15 +194,6 @@ class PreparedAlignment:
     base_offset_x: float
     corr_for_fit: np.ndarray
 
-
-def find_repo_root(start: Path | None = None) -> Path:
-    start = (start or Path.cwd()).resolve()
-    for candidate in (start, *start.parents):
-        if (candidate / "src").exists() and (candidate / "data").exists():
-            return candidate
-    raise FileNotFoundError("Could not locate repo root from current working directory.")
-
-
 def resolved_path(path: str | Path) -> Path:
     return Path(path).expanduser().resolve(strict=False)
 
@@ -230,20 +220,6 @@ def _load_mapping_file(path: Path) -> dict[str, Any]:
             raise ValueError(f"Expected mapping payload in {path}")
         return payload
     raise ValueError(f"Unsupported parameter file format: {path}")
-
-
-def _root_para_supports_stage_crops(path: Path) -> bool:
-    if not path.exists():
-        return False
-    try:
-        payload = _load_mapping_file(path)
-    except Exception:
-        return False
-    left = payload.get("left")
-    right = payload.get("right")
-    if not isinstance(left, dict) or not isinstance(right, dict):
-        return False
-    return left.get("crop_bounds") is not None and right.get("crop_bounds") is not None
 
 
 def parse_roi(values: Sequence[int] | None) -> Roi | None:
@@ -1370,7 +1346,7 @@ def save_root_para(
     right_crop_bounds: FitWindow | None = None,
     final_crop_bounds: FitWindow | None = None,
 ) -> None:
-    payload: dict[str, Any] = {
+    payload = {
         "version": 1,
         "order": "vertical_then_horizontal",
         "pre_stitch_shape": [int(pre_stitch_shape[0]), int(pre_stitch_shape[1])],
@@ -1852,29 +1828,14 @@ def _normalize_mode_triplet(value: Any) -> list[str]:
     raise ValueError("mode must be a string or a 3-item sequence ordered as [L, R, LR].")
 
 
-def _get_frame_arg(args: argparse.Namespace) -> tuple[int, int]:
-    frame = getattr(args, "frame", None)
-    if frame is not None:
-        values = [int(v) for v in frame]
-        if len(values) != 2:
-            raise ValueError("frame must be [start, end), with end < 1 meaning full range.")
-        return int(values[0]), int(values[1])
-    max_frames = getattr(args, "max_frames", None)
-    return (0, int(max_frames)) if max_frames is not None else (0, -1)
-
-
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive manual ROI phase-correlation stitch tool.")
-    parser.add_argument("--x-load-path", type=Path, default=None)
-    parser.add_argument("--y-save-path", type=Path, default=None)
-    parser.add_argument("--result-save-folder", "--result-save-fold", dest="result_save_fold", type=Path, default=None)
-    parser.add_argument("--data-path", type=Path, default=None)
-    parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--frame", type=int, nargs=2, default=None, metavar=("START", "END"))
-    parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--x-load-path", type=Path, required=True)
+    parser.add_argument("--y-save-path", type=Path, required=True)
+    parser.add_argument("--stitch-save-fold", type=Path, required=True)
+    parser.add_argument("--frame", type=int, nargs=2, default=(0, -1), metavar=("START", "END"))
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
-    parser.add_argument("--mode", nargs="+", choices=("raw", "frangi"), default=None)
-    parser.add_argument("--preprocessing-mode", nargs="+", choices=("raw", "frangi"), default=None)
+    parser.add_argument("--mode", nargs="+", choices=("raw", "frangi"), default=list(_normalize_mode_triplet(None)))
     parser.add_argument("--vessel-keep-percent", type=float, default=DEFAULT_VESSEL_KEEP_PERCENT)
     parser.add_argument("--frangi-sigmas", type=float, nargs="+", default=DEFAULT_FRANGI_SIGMAS)
     parser.add_argument("--fit-point-radius", type=int, default=DEFAULT_FIT_POINT_RADIUS)
@@ -1890,8 +1851,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--final-right-roi", type=int, nargs=4, default=None)
     parser.add_argument("--final-fit-window", type=int, nargs=4, default=None)
     parser.add_argument("--final-fit-point", type=int, nargs=2, default=None)
-    parser.add_argument("--top-roi", type=int, nargs=4, default=None)
-    parser.add_argument("--bottom-roi", type=int, nargs=4, default=None)
     return parser
 
 
@@ -1966,87 +1925,72 @@ def write_stitched_tiff(
 
 
 def run(args: argparse.Namespace) -> int:
-    repo_root = find_repo_root()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    x_load_path = getattr(args, "x_load_path", None) or getattr(args, "data_path", None) or (repo_root / "data" / "X.tif")
-    y_save_path = getattr(args, "y_save_path", None) or (repo_root / "outputs" / "stitched" / f"{Path(x_load_path).stem}_stitched_{timestamp}.tif")
-    result_save_fold = getattr(args, "result_save_fold", None) or getattr(args, "result_save_folder", None) or getattr(args, "output_dir", None) or (repo_root / "outputs" / "interactive_roi_phasecorr" / timestamp)
-    x_load_path = resolved_path(x_load_path)
-    y_save_path = resolved_path(y_save_path)
-    result_save_fold = resolved_path(result_save_fold)
+    x_load_path = resolved_path(args.x_load_path)
+    y_save_path = resolved_path(args.y_save_path)
+    stitch_save_fold = resolved_path(args.stitch_save_fold)
     if x_load_path == y_save_path:
         raise ValueError("x_load_path and y_save_path must be different.")
 
-    cache_dir = repo_root / "tmp" / "manual_roi_phasecorr_cache"
+    cache_dir = stitch_save_fold / "_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    chunk_size = int(max(getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE), 1))
-    frame_cfg = _get_frame_arg(args)
-    mode_value = getattr(args, "mode", None) if getattr(args, "mode", None) is not None else getattr(args, "preprocessing_mode", None)
-    mode_triplet = _normalize_mode_triplet(mode_value)
-    vessel_keep_percent = float(getattr(args, "vessel_keep_percent", DEFAULT_VESSEL_KEEP_PERCENT))
-    frangi_sigmas = tuple(float(v) for v in getattr(args, "frangi_sigmas", DEFAULT_FRANGI_SIGMAS))
-    fit_point_radius = int(max(getattr(args, "fit_point_radius", DEFAULT_FIT_POINT_RADIUS), 1))
+    chunk_size = int(max(args.chunk_size, 1))
+    frame_cfg = tuple(int(v) for v in args.frame)
+    mode_triplet = _normalize_mode_triplet(args.mode)
+    vessel_keep_percent = float(args.vessel_keep_percent)
+    frangi_sigmas = tuple(float(v) for v in args.frangi_sigmas)
+    fit_point_radius = int(max(args.fit_point_radius, 1))
 
     projection, estimation_frame = load_or_project_sum(x_load_path, frame_cfg, chunk_size, cache_dir, use_cache=True)
     quadrants = split_rotate_quadrants(projection)
-    result_save_fold.mkdir(parents=True, exist_ok=True)
+    stitch_save_fold.mkdir(parents=True, exist_ok=True)
     y_save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    left_top_roi = parse_roi(getattr(args, "left_top_roi", None) if getattr(args, "left_top_roi", None) is not None else getattr(args, "top_roi", None))
-    left_bottom_roi = parse_roi(getattr(args, "left_bottom_roi", None) if getattr(args, "left_bottom_roi", None) is not None else getattr(args, "bottom_roi", None))
-    left_fit_window = parse_roi(getattr(args, "left_fit_window", None))
-    left_fit_point = parse_fit_point(getattr(args, "left_fit_point", None))
-    right_top_roi = parse_roi(getattr(args, "right_top_roi", None))
-    right_bottom_roi = parse_roi(getattr(args, "right_bottom_roi", None))
-    right_fit_window = parse_roi(getattr(args, "right_fit_window", None))
-    right_fit_point = parse_fit_point(getattr(args, "right_fit_point", None))
-    final_left_roi = parse_roi(getattr(args, "final_left_roi", None))
-    final_right_roi = parse_roi(getattr(args, "final_right_roi", None))
-    final_fit_window = parse_roi(getattr(args, "final_fit_window", None))
-    final_fit_point = parse_fit_point(getattr(args, "final_fit_point", None))
+    left_top_roi = parse_roi(args.left_top_roi)
+    left_bottom_roi = parse_roi(args.left_bottom_roi)
+    left_fit_window = parse_roi(args.left_fit_window)
+    left_fit_point = parse_fit_point(args.left_fit_point)
+    right_top_roi = parse_roi(args.right_top_roi)
+    right_bottom_roi = parse_roi(args.right_bottom_roi)
+    right_fit_window = parse_roi(args.right_fit_window)
+    right_fit_point = parse_fit_point(args.right_fit_point)
+    final_left_roi = parse_roi(args.final_left_roi)
+    final_right_roi = parse_roi(args.final_right_roi)
+    final_fit_window = parse_roi(args.final_fit_window)
+    final_fit_point = parse_fit_point(args.final_fit_point)
 
-    left_para_path = result_save_fold / "L" / "para.json"
-    right_para_path = result_save_fold / "R" / "para.json"
-    final_para_path = result_save_fold / "LR" / "para.json"
+    left_para_path = stitch_save_fold / "L" / "para.json"
+    right_para_path = stitch_save_fold / "R" / "para.json"
+    final_para_path = stitch_save_fold / "LR" / "para.json"
 
-    left_result, _left_paths, left_reused = run_pair_alignment(pair_label="Left column", reference_label="top", moving_label="bottom", reference_image=quadrants["upper_left"], moving_image=quadrants["lower_left"], initial_reference_roi=left_top_roi, initial_moving_roi=left_bottom_roi, initial_fit_window=left_fit_window, initial_fit_point=left_fit_point, output_dir=result_save_fold / "L", preprocessing_mode=mode_triplet[0], vessel_keep_percent=vessel_keep_percent, frangi_sigmas=frangi_sigmas, fit_point_radius=fit_point_radius, stitch_axis="vertical", roi_selector_mode="vertical_mirror", stage_para_path=left_para_path, allow_para_reuse=True)
-    right_result, _right_paths, right_reused = run_pair_alignment(pair_label="Right column", reference_label="top", moving_label="bottom", reference_image=quadrants["upper_right"], moving_image=quadrants["lower_right"], initial_reference_roi=right_top_roi, initial_moving_roi=right_bottom_roi, initial_fit_window=right_fit_window, initial_fit_point=right_fit_point, output_dir=result_save_fold / "R", preprocessing_mode=mode_triplet[1], vessel_keep_percent=vessel_keep_percent, frangi_sigmas=frangi_sigmas, fit_point_radius=fit_point_radius, stitch_axis="vertical", roi_selector_mode="vertical_mirror", stage_para_path=right_para_path, allow_para_reuse=True)
+    left_result, _left_paths, _left_reused = run_pair_alignment(pair_label="Left column", reference_label="top", moving_label="bottom", reference_image=quadrants["upper_left"], moving_image=quadrants["lower_left"], initial_reference_roi=left_top_roi, initial_moving_roi=left_bottom_roi, initial_fit_window=left_fit_window, initial_fit_point=left_fit_point, output_dir=stitch_save_fold / "L", preprocessing_mode=mode_triplet[0], vessel_keep_percent=vessel_keep_percent, frangi_sigmas=frangi_sigmas, fit_point_radius=fit_point_radius, stitch_axis="vertical", roi_selector_mode="vertical_mirror", stage_para_path=left_para_path, allow_para_reuse=True)
+    right_result, _right_paths, _right_reused = run_pair_alignment(pair_label="Right column", reference_label="top", moving_label="bottom", reference_image=quadrants["upper_right"], moving_image=quadrants["lower_right"], initial_reference_roi=right_top_roi, initial_moving_roi=right_bottom_roi, initial_fit_window=right_fit_window, initial_fit_point=right_fit_point, output_dir=stitch_save_fold / "R", preprocessing_mode=mode_triplet[1], vessel_keep_percent=vessel_keep_percent, frangi_sigmas=frangi_sigmas, fit_point_radius=fit_point_radius, stitch_axis="vertical", roi_selector_mode="vertical_mirror", stage_para_path=right_para_path, allow_para_reuse=True)
 
     left_stitched_raw = stitch_pair(quadrants["upper_left"], quadrants["lower_left"], left_result.offset_y, left_result.offset_x)
     left_stitched_transition = stitch_pair_transition(quadrants["upper_left"], quadrants["lower_left"], left_result.offset_y, left_result.offset_x, blend_axis="vertical")
     left_crop_bounds = compute_pair_crop_bounds(quadrants["upper_left"].shape, quadrants["lower_left"].shape, left_result.offset_y, left_result.offset_x, blend_axis="vertical")
-    save_stitched_preview_cropped(result_save_fold / "L", "result-3.png", left_stitched_raw, left_crop_bounds)
-    save_stitched_preview_cropped(result_save_fold / "L", "result-4.png", left_stitched_transition, left_crop_bounds)
+    save_stitched_preview_cropped(stitch_save_fold / "L", "result-3.png", left_stitched_raw, left_crop_bounds)
+    save_stitched_preview_cropped(stitch_save_fold / "L", "result-4.png", left_stitched_transition, left_crop_bounds)
     left_stitched_transition_cropped = crop_image(left_stitched_transition, left_crop_bounds)
 
     right_stitched_raw = stitch_pair(quadrants["upper_right"], quadrants["lower_right"], right_result.offset_y, right_result.offset_x)
     right_stitched_transition = stitch_pair_transition(quadrants["upper_right"], quadrants["lower_right"], right_result.offset_y, right_result.offset_x, blend_axis="vertical")
     right_crop_bounds = compute_pair_crop_bounds(quadrants["upper_right"].shape, quadrants["lower_right"].shape, right_result.offset_y, right_result.offset_x, blend_axis="vertical")
-    save_stitched_preview_cropped(result_save_fold / "R", "result-3.png", right_stitched_raw, right_crop_bounds)
-    save_stitched_preview_cropped(result_save_fold / "R", "result-4.png", right_stitched_transition, right_crop_bounds)
+    save_stitched_preview_cropped(stitch_save_fold / "R", "result-3.png", right_stitched_raw, right_crop_bounds)
+    save_stitched_preview_cropped(stitch_save_fold / "R", "result-4.png", right_stitched_transition, right_crop_bounds)
     right_stitched_transition_cropped = crop_image(right_stitched_transition, right_crop_bounds)
 
-    root_para_path = result_save_fold / "para.json"
-    existing_root_para_path = root_para_path
-    allow_final_para_reuse = left_reused and right_reused and _root_para_supports_stage_crops(existing_root_para_path)
-    final_result, _final_paths, _final_reused = run_pair_alignment(pair_label="Final left-right", reference_label="left", moving_label="right", reference_image=left_stitched_transition_cropped, moving_image=right_stitched_transition_cropped, initial_reference_roi=final_left_roi, initial_moving_roi=final_right_roi, initial_fit_window=final_fit_window, initial_fit_point=final_fit_point, output_dir=result_save_fold / "LR", preprocessing_mode=mode_triplet[2], vessel_keep_percent=vessel_keep_percent, frangi_sigmas=frangi_sigmas, fit_point_radius=fit_point_radius, stitch_axis="horizontal", roi_selector_mode="horizontal_mirror", stage_para_path=final_para_path, allow_para_reuse=allow_final_para_reuse)
+    root_para_path = stitch_save_fold / "para.json"
+    final_result, _final_paths, _final_reused = run_pair_alignment(pair_label="Final left-right", reference_label="left", moving_label="right", reference_image=left_stitched_transition_cropped, moving_image=right_stitched_transition_cropped, initial_reference_roi=final_left_roi, initial_moving_roi=final_right_roi, initial_fit_window=final_fit_window, initial_fit_point=final_fit_point, output_dir=stitch_save_fold / "LR", preprocessing_mode=mode_triplet[2], vessel_keep_percent=vessel_keep_percent, frangi_sigmas=frangi_sigmas, fit_point_radius=fit_point_radius, stitch_axis="horizontal", roi_selector_mode="horizontal_mirror", stage_para_path=final_para_path, allow_para_reuse=True)
 
     final_stitched_raw = stitch_pair(left_stitched_transition_cropped, right_stitched_transition_cropped, final_result.offset_y, final_result.offset_x)
     final_stitched_transition = stitch_pair_transition(left_stitched_transition_cropped, right_stitched_transition_cropped, final_result.offset_y, final_result.offset_x, blend_axis="horizontal")
     final_crop_bounds = compute_pair_crop_bounds(left_stitched_transition_cropped.shape, right_stitched_transition_cropped.shape, final_result.offset_y, final_result.offset_x, blend_axis="horizontal")
-    save_stitched_preview_cropped(result_save_fold / "LR", "result-3.png", final_stitched_raw, final_crop_bounds)
-    save_stitched_preview_cropped(result_save_fold / "LR", "result-4.png", final_stitched_transition, final_crop_bounds)
+    save_stitched_preview_cropped(stitch_save_fold / "LR", "result-3.png", final_stitched_raw, final_crop_bounds)
+    save_stitched_preview_cropped(stitch_save_fold / "LR", "result-4.png", final_stitched_transition, final_crop_bounds)
 
     save_root_para(root_para_path, pre_stitch_shape=projection.shape, estimation_frame=estimation_frame, left_result=left_result, right_result=right_result, final_result=final_result, left_crop_bounds=left_crop_bounds, right_crop_bounds=right_crop_bounds, final_crop_bounds=final_crop_bounds)
     write_stitched_tiff(x_load_path, y_save_path, left_result, right_result, final_result, chunk_size=chunk_size, left_crop_bounds=left_crop_bounds, right_crop_bounds=right_crop_bounds, final_crop_bounds=final_crop_bounds)
     return 0
-
-
-def _as_path(value: str | Path | None) -> Path | None:
-    if value is None:
-        return None
-    return Path(value)
-
 
 def _as_list4(value: Sequence[int] | None) -> list[int] | None:
     if value is None:
@@ -2074,13 +2018,10 @@ class Stitch:
         self,
         x_load_path: str | Path,
         y_save_path: str | Path,
-        stitch_save_fold: str | Path | None = None,
-        result_save_folder: str | Path | None = None,
+        stitch_save_fold: str | Path,
         frame: Sequence[int] = (0, -1),
-        max_frames: int | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         mode: str | Sequence[str] = ("frangi", "frangi", "raw"),
-        preprocessing_mode: str | Sequence[str] | None = None,
         vessel_keep_percent: float = DEFAULT_VESSEL_KEEP_PERCENT,
         frangi_sigmas: Sequence[float] = DEFAULT_FRANGI_SIGMAS,
         fit_point_radius: int = DEFAULT_FIT_POINT_RADIUS,
@@ -2097,20 +2038,13 @@ class Stitch:
         final_fit_window: Sequence[int] | None = None,
         final_fit_point: Sequence[int] | None = None,
         enable: bool = True,
-        **kwargs: Any,
     ) -> None:
         self.enable = bool(enable)
         self.x_load_path = Path(x_load_path)
         self.y_save_path = Path(y_save_path)
-        self.stitch_save_fold = _as_path(
-            stitch_save_fold if stitch_save_fold is not None else result_save_folder
-        )
-        if max_frames is not None and tuple(int(v) for v in frame) == (0, -1):
-            frame = (0, int(max_frames))
+        self.stitch_save_fold = Path(stitch_save_fold)
         self.frame = _as_frame_range(frame)
         self.chunk_size = int(chunk_size)
-        if preprocessing_mode is not None:
-            mode = preprocessing_mode
         if isinstance(mode, str):
             self.mode: list[str] = [mode]
         else:
@@ -2137,15 +2071,10 @@ class Stitch:
         args = argparse.Namespace(
             x_load_path=self.x_load_path,
             y_save_path=self.y_save_path,
-            result_save_fold=self.stitch_save_fold,
-            result_save_folder=self.stitch_save_fold,
-            data_path=None,
-            output_dir=None,
+            stitch_save_fold=self.stitch_save_fold,
             frame=self.frame,
-            max_frames=None,
             chunk_size=self.chunk_size,
             mode=self.mode,
-            preprocessing_mode=self.mode,
             vessel_keep_percent=self.vessel_keep_percent,
             frangi_sigmas=list(self.frangi_sigmas),
             fit_point_radius=self.fit_point_radius,
@@ -2161,8 +2090,6 @@ class Stitch:
             final_right_roi=self.final_right_roi,
             final_fit_window=self.final_fit_window,
             final_fit_point=self.final_fit_point,
-            top_roi=None,
-            bottom_roi=None,
         )
         run(args)
 

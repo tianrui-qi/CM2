@@ -1,0 +1,270 @@
+:root {
+  --bg: #f4f1ea;
+  --panel: #fffdf8;
+  --border: #d8d0c3;
+  --text: #201b16;
+  --muted: #6f665c;
+  --accent: #184d47;
+  --accent-soft: #e4efe9;
+  --shadow: 0 18px 40px rgba(52, 38, 24, 0.08);
+  --radius: 18px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Helvetica Neue", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(24, 77, 71, 0.08), transparent 30%),
+    linear-gradient(180deg, #f8f4ed 0%, #f1ede5 100%);
+}
+
+.page {
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.panel-header h2,
+.plot-card-header h3,
+.plot-card-header h4 {
+  margin: 0;
+  font-family: "Avenir Next", "Helvetica Neue", sans-serif;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.subtitle,
+.summary-label {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.status-banner {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(24, 77, 71, 0.08);
+  color: var(--accent);
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+
+.status-banner.hidden {
+  display: none;
+}
+
+.status-banner.error {
+  background: rgba(163, 34, 24, 0.1);
+  color: #8a271f;
+}
+
+.roi-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.app-grid {
+  display: grid;
+  grid-template-columns: minmax(440px, 1.05fr) minmax(420px, 0.95fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.panel,
+.roi-item {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.panel {
+  padding: 16px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+
+.side-header {
+  justify-content: flex-end;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field select,
+.roi-name-input,
+.roi-color-input,
+button {
+  font: inherit;
+}
+
+.field select,
+.roi-name-input {
+  min-width: 180px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 10px;
+  background: #fff;
+}
+
+.primary-btn,
+.secondary-btn,
+.mini-btn {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 10px 14px;
+  background: #fff;
+  color: var(--text);
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.primary-btn {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.mini-btn {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+.plot-frame {
+  width: 100%;
+  min-height: 320px;
+}
+
+.plot-frame.map-frame {
+  min-height: 0;
+  height: auto;
+  aspect-ratio: 3744 / 2693;
+}
+
+.side-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.roi-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.roi-item {
+  padding: 12px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.roi-item.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(24, 77, 71, 0.18), var(--shadow);
+}
+
+.roi-main {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.roi-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  flex: 0 0 auto;
+}
+
+.roi-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.roi-name-input {
+  width: 100%;
+  min-width: 0;
+}
+
+.roi-subtext {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.roi-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.roi-color-input {
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.plot-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+@media (max-width: 1280px) {
+  .app-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 800px) {
+  .page {
+    padding: 16px;
+  }
+
+  .panel-header {
+    flex-direction: column;
+  }
+
+  .roi-item {
+    grid-template-columns: 1fr;
+  }
+
+  .roi-controls {
+    justify-content: flex-start;
+  }
+}

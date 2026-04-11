@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Neuron ROI Visualization</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="page">
+    <div id="status-banner" class="status-banner">Loading cache…</div>
+
+    <div class="app-grid">
+      <section class="panel map-panel">
+        <div class="panel-header">
+          <div>
+            <h2>Neuron Map</h2>
+          </div>
+        </div>
+        <div id="map-plot" class="plot-frame map-frame"></div>
+      </section>
+
+      <div class="side-stack">
+        <section class="panel">
+        <div class="panel-header side-header">
+          <div class="roi-actions">
+            <button id="add-roi-btn" class="primary-btn">Add ROI</button>
+          </div>
+        </div>
+
+        <div id="roi-list" class="roi-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="plot-card-header">
+            <h4>Trace</h4>
+            <button id="download-c-traces-btn" class="mini-btn">Download PNG</button>
+          </div>
+          <div id="c-trace-plot" class="plot-frame"></div>
+        </section>
+
+        <section class="panel">
+          <div class="plot-card-header">
+            <h4>Heatmap</h4>
+            <button id="download-c-heatmap-btn" class="mini-btn">Download PNG</button>
+          </div>
+          <div id="c-heatmap-plot" class="plot-frame"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <script src="/vendor/plotly.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

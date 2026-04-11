@@ -34,10 +34,10 @@ def main(cfg: omegaconf.DictConfig) -> None:
             Path(cfg.save.y_load_path).parent / "save"
         )
     # forward
-    if cfg.stitch.enable:
-        src.Stitch(**cfg.stitch).forward()
     if cfg.normalize.enable:
         src.Normalize(**cfg.normalize).forward()
+    if cfg.stitch.enable:
+        src.Stitch(**cfg.stitch).forward()
     if cfg.crop.enable:
         src.Crop(**cfg.crop).forward()
     if cfg.extract.enable:
