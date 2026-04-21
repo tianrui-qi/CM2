@@ -845,8 +845,6 @@ def save_overlap_outputs(
         total=total_figures,
         desc="save(overlap)",
         dynamic_ncols=True,
-        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
-        unit="figure",
     ) as progress_bar:
         _overlay_folder(
             pointmap_dir,
@@ -1611,7 +1609,7 @@ def run(
     y_load_path: str,
     extract_fold: str | None,
     save_fold: str | None,
-    crop_load_path: str | None,
+    crop_load_fold: str | None,
     t_snr: Sequence[float | None] | None,
     t_r_value: Sequence[float | None] | None,
     t_lam: Sequence[float | None] | None,
@@ -1704,10 +1702,10 @@ def run(
         )
 
         if missing_2d_outputs or missing_3d_outputs:
-            if crop_load_path is None:
-                raise ValueError("save requires crop_load_path pointing to the crop folder.")
+            if crop_load_fold is None:
+                raise ValueError("save requires crop_load_fold pointing to the crop folder.")
             if core_specs is None:
-                crop_params = load_crop_params(Path(crop_load_path))
+                crop_params = load_crop_params(Path(crop_load_fold))
                 patch_specs = crop_params["patch_specs"]
                 core_specs = {
                     spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
@@ -1763,7 +1761,7 @@ class Save:
         y_load_path: str,
         extract_fold: str | None,
         save_fold: str | None,
-        crop_load_path: str | None,
+        crop_load_fold: str | None,
         t_snr: Sequence[float | None] | None,
         t_r_value: Sequence[float | None] | None,
         t_lam: Sequence[float | None] | None,
@@ -1780,7 +1778,7 @@ class Save:
         self.y_load_path = y_load_path
         self.extract_fold = extract_fold
         self.save_fold = save_fold
-        self.crop_load_path = crop_load_path
+        self.crop_load_fold = crop_load_fold
         self.t_snr = _normalize_qc_bounds(t_snr, "snr")
         self.t_r_value = _normalize_qc_bounds(t_r_value, "r_value")
         self.t_lam = _normalize_qc_bounds(t_lam, "lam")
@@ -1794,7 +1792,7 @@ class Save:
             y_load_path=self.y_load_path,
             extract_fold=self.extract_fold,
             save_fold=self.save_fold,
-            crop_load_path=self.crop_load_path,
+            crop_load_fold=self.crop_load_fold,
             t_snr=self.t_snr,
             t_r_value=self.t_r_value,
             t_lam=self.t_lam,

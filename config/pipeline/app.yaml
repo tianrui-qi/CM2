@@ -2,6 +2,7 @@
 
 data_fold: null
 bg_load_path: null        # default: data_fold/save/Ybandpass.tif
+crop_load_fold: null      # default: data_fold/crop/
 extract_load_fold: null   # default: data_fold/extract/
 app_fold: null            # default: data_fold/app/
 

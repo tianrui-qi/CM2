@@ -28,6 +28,7 @@ from caiman.source_extraction.cnmf.cnmf import load_CNMF
 from caiman.source_extraction.cnmf import params as params
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import matplotlib.colors as mcolors
+from matplotlib.figure import Figure
 import matplotlib.patheffects as mpe
 import matplotlib.pyplot as plt
 from scipy.sparse import csc_matrix
@@ -1414,7 +1415,10 @@ def _render_metric_dots_tif(
     cmap_name: str,
     norm: mcolors.Normalize,
 ) -> None:
-    fig = plt.figure(
+    # Build an off-screen Agg figure directly instead of `plt.figure()`.
+    # The macOS interactive backend mutates very large figure sizes here,
+    # which produces distorted TIFF dimensions for point maps.
+    fig = Figure(
         figsize=(
             full_w * QUALITY_RENDER_SCALE_FACTOR / QUALITY_RENDER_DPI,
             full_h * QUALITY_RENDER_SCALE_FACTOR / QUALITY_RENDER_DPI,

@@ -9,16 +9,10 @@ const DEFAULT_ROI_COLORS = [
 ];
 const UNASSIGNED_POINT_COLOR = "rgba(248,248,248,0.62)";
 const UNASSIGNED_LINE_COLOR = "rgba(32,27,22,0.28)";
-const TRACE_SOURCE_ORDER = ["c"];
-const TRACE_SOURCE_VIEW_SPECS = {
-  c: {
-    tracePlotId: "c-trace-plot",
-    heatmapPlotId: "c-heatmap-plot",
-    traceDownloadButtonId: "download-c-traces-btn",
-    heatmapDownloadButtonId: "download-c-heatmap-btn",
-    traceDownloadName: "roi_traces_c",
-    heatmapDownloadName: "roi_heatmap_c",
-  },
+const TRACE_SOURCE_ORDER = ["c", "c_plus_yra"];
+const TRACE_SOURCE_UI_LABELS = {
+  c: "C",
+  c_plus_yra: "C + YrA",
 };
 
 const state = {
@@ -27,8 +21,9 @@ const state = {
   tracesBySource: {},
   rois: [],
   activeRoiId: null,
+  activeSignalSource: "c",
   mapPlotReady: false,
-  mapLastWidth: null,
+  mapViewportKey: null,
 };
 
 function setStatus(message, isError = false) {
@@ -92,6 +87,7 @@ function saveUiState() {
   const payload = {
     rois: state.rois,
     activeRoiId: state.activeRoiId,
+    activeSignalSource: state.activeSignalSource,
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
 }
@@ -123,10 +119,36 @@ function loadUiState() {
         : [],
     }));
     state.activeRoiId = getRoiById(parsed.activeRoiId)?.id ?? state.rois[0].id;
+    const storedSource = typeof parsed.activeSignalSource === "string"
+      ? parsed.activeSignalSource
+      : parsed.activeTraceSource;
+    if (
+      typeof storedSource === "string"
+      && TRACE_SOURCE_ORDER.includes(storedSource)
+    ) {
+      state.activeSignalSource = storedSource;
+    }
     return true;
   } catch (error) {
     console.error(error);
     return false;
+  }
+}
+
+function getAvailableTraceSourceKeys() {
+  if (!state.meta) {
+    return [];
+  }
+  return TRACE_SOURCE_ORDER.filter((sourceKey) => Boolean(state.meta.trace_sources?.[sourceKey]));
+}
+
+function ensureValidActiveTraceSource() {
+  const available = getAvailableTraceSourceKeys();
+  if (!available.length) {
+    return;
+  }
+  if (!available.includes(state.activeSignalSource)) {
+    state.activeSignalSource = available[0];
   }
 }
 
@@ -153,10 +175,33 @@ function buildMapMarkerColors() {
 }
 
 function computeMapHeight() {
-  const plotDiv = document.getElementById("map-plot");
-  const width = Math.max(plotDiv?.clientWidth ?? 0, 320);
-  const aspectRatio = state.meta.full_height / state.meta.full_width;
-  return Math.max(420, Math.round(width * aspectRatio) + 16);
+  return window.innerHeight;
+}
+
+function computeMapCoverRanges() {
+  const fullWidth = Number(state.meta.full_width);
+  const fullHeight = Number(state.meta.full_height);
+  const viewportWidth = Math.max(window.innerWidth, 1);
+  const viewportHeight = Math.max(computeMapHeight(), 1);
+  const viewportAspect = viewportWidth / viewportHeight;
+  const imageAspect = fullWidth / fullHeight;
+
+  let viewWidth;
+  let viewHeight;
+  if (viewportAspect >= imageAspect) {
+    viewWidth = fullWidth;
+    viewHeight = fullWidth / viewportAspect;
+  } else {
+    viewHeight = fullHeight;
+    viewWidth = fullHeight * viewportAspect;
+  }
+
+  const centerX = fullWidth / 2;
+  const centerY = fullHeight / 2;
+  return {
+    xRange: [centerX - viewWidth / 2, centerX + viewWidth / 2],
+    yRange: [centerY + viewHeight / 2, centerY - viewHeight / 2],
+  };
 }
 
 function renderRoiList() {
@@ -165,37 +210,11 @@ function renderRoiList() {
   for (const roi of state.rois) {
     const item = document.createElement("div");
     item.className = `roi-item${roi.id === state.activeRoiId ? " active" : ""}`;
+    item.style.background = roi.color;
+    item.title = `${roi.name} • ${roi.neuronIds.length} neurons • double-click to change color`;
 
-    const main = document.createElement("div");
-    main.className = "roi-main";
-
-    const swatch = document.createElement("span");
-    swatch.className = "roi-swatch";
-    swatch.style.background = roi.color;
-
-    const meta = document.createElement("div");
-    meta.className = "roi-meta";
-
-    const nameInput = document.createElement("input");
-    nameInput.className = "roi-name-input";
-    nameInput.value = roi.name;
-    nameInput.addEventListener("input", () => {
-      roi.name = nameInput.value || "Untitled ROI";
-      saveUiState();
-      updatePlots();
-    });
-
-    const subtext = document.createElement("div");
-    subtext.className = "roi-subtext";
-    subtext.textContent = `${roi.neuronIds.length} neurons`;
-
-    meta.appendChild(nameInput);
-    meta.appendChild(subtext);
-    main.appendChild(swatch);
-    main.appendChild(meta);
-
-    const controls = document.createElement("div");
-    controls.className = "roi-controls";
+    const face = document.createElement("div");
+    face.className = "roi-card-face";
 
     const colorInput = document.createElement("input");
     colorInput.type = "color";
@@ -203,25 +222,45 @@ function renderRoiList() {
     colorInput.className = "roi-color-input";
     colorInput.addEventListener("input", () => {
       roi.color = colorInput.value;
-      swatch.style.background = roi.color;
+      item.style.background = roi.color;
       saveUiState();
       renderMap();
+      renderRoiList();
       updatePlots();
     });
+    item.addEventListener("dblclick", (event) => {
+      if (event.target instanceof HTMLButtonElement) {
+        return;
+      }
+      colorInput.click();
+    });
+    item.addEventListener("click", (event) => {
+      if (event.target instanceof HTMLButtonElement) {
+        return;
+      }
+      colorInput.click();
+    });
+
+    const controls = document.createElement("div");
+    controls.className = "roi-controls";
 
     const selectBtn = document.createElement("button");
-    selectBtn.className = "mini-btn";
-    selectBtn.textContent = roi.id === state.activeRoiId ? "Active" : "Activate";
-    selectBtn.addEventListener("click", () => {
-      state.activeRoiId = roi.id;
+    selectBtn.className = `roi-chip-btn${roi.id === state.activeRoiId ? " is-active" : ""}`;
+    selectBtn.textContent = "✓";
+    selectBtn.title = roi.id === state.activeRoiId ? "Deactivate ROI" : "Activate ROI";
+    selectBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      state.activeRoiId = roi.id === state.activeRoiId ? null : roi.id;
       saveUiState();
       renderRoiList();
     });
 
     const clearBtn = document.createElement("button");
-    clearBtn.className = "mini-btn";
-    clearBtn.textContent = "Clear";
-    clearBtn.addEventListener("click", () => {
+    clearBtn.className = "roi-chip-btn";
+    clearBtn.textContent = "⌫";
+    clearBtn.title = "Clear ROI neurons";
+    clearBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
       roi.neuronIds = [];
       saveUiState();
       renderMap();
@@ -230,10 +269,12 @@ function renderRoiList() {
     });
 
     const deleteBtn = document.createElement("button");
-    deleteBtn.className = "mini-btn";
-    deleteBtn.textContent = "Delete";
+    deleteBtn.className = "roi-chip-btn";
+    deleteBtn.textContent = "✕";
+    deleteBtn.title = "Delete ROI";
     deleteBtn.disabled = state.rois.length <= 1;
-    deleteBtn.addEventListener("click", () => {
+    deleteBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
       state.rois = state.rois.filter((r) => r.id !== roi.id);
       ensureAtLeastOneRoi();
       if (!getRoiById(state.activeRoiId)) {
@@ -245,39 +286,39 @@ function renderRoiList() {
       updatePlots();
     });
 
-    controls.appendChild(colorInput);
     controls.appendChild(selectBtn);
     controls.appendChild(clearBtn);
     controls.appendChild(deleteBtn);
 
-    item.appendChild(main);
+    item.appendChild(face);
     item.appendChild(controls);
+    item.appendChild(colorInput);
     container.appendChild(item);
   }
 }
 
 function buildMapLayout() {
   const background = state.meta.backgrounds.find((bg) => bg.key === state.meta.default_background_key) ?? state.meta.backgrounds[0];
+  const { xRange, yRange } = computeMapCoverRanges();
   return {
-    margin: { l: 8, r: 8, t: 8, b: 8 },
+    margin: { l: 0, r: 0, t: 0, b: 0 },
     height: computeMapHeight(),
+    autosize: true,
     xaxis: {
-      range: [0, state.meta.full_width],
+      range: xRange,
       showgrid: false,
       zeroline: false,
       showticklabels: false,
       fixedrange: false,
-      constrain: "domain",
     },
     yaxis: {
-      range: [state.meta.full_height, 0],
+      range: yRange,
       showgrid: false,
       zeroline: false,
       showticklabels: false,
       fixedrange: false,
       scaleanchor: "x",
       scaleratio: 1,
-      constrain: "domain",
     },
     images: [
       {
@@ -294,7 +335,7 @@ function buildMapLayout() {
         opacity: 1,
       },
     ],
-    paper_bgcolor: "#111",
+    paper_bgcolor: "#000",
     plot_bgcolor: "#000",
     dragmode: "pan",
     hovermode: "closest",
@@ -328,9 +369,10 @@ function renderMap() {
     displayModeBar: true,
     modeBarButtonsToRemove: ["select2d", "lasso2d"],
     displaylogo: false,
+    scrollZoom: true,
   };
   const plotDiv = document.getElementById("map-plot");
-  state.mapLastWidth = plotDiv.clientWidth;
+  state.mapViewportKey = `${window.innerWidth}x${window.innerHeight}`;
   Plotly.react(plotDiv, [trace], layout, config).then(() => {
     if (!state.mapPlotReady) {
       plotDiv.on("plotly_click", (event) => {
@@ -342,6 +384,29 @@ function renderMap() {
       state.mapPlotReady = true;
     }
   });
+}
+
+function renderSourceToggle(containerId, activeSourceKey, onSelect) {
+  const container = document.getElementById(containerId);
+  if (!container) {
+    return;
+  }
+  container.innerHTML = "";
+  const available = getAvailableTraceSourceKeys();
+  if (available.length <= 1) {
+    container.style.display = "none";
+    return;
+  }
+  container.style.display = "inline-flex";
+  for (const sourceKey of available) {
+    const button = document.createElement("button");
+    button.className = `trace-source-btn${sourceKey === activeSourceKey ? " active" : ""}`;
+    button.innerHTML = TRACE_SOURCE_UI_LABELS[sourceKey] ?? sourceKey;
+    button.addEventListener("click", () => {
+      onSelect(sourceKey);
+    });
+    container.appendChild(button);
+  }
 }
 
 function handleNeuronToggle(pointIndex) {
@@ -390,7 +455,6 @@ function buildTracePlotData(sourceKey) {
   const time = Array.from({ length: nFrames }, (_, idx) => idx / frameRate);
   const traces = [];
   const shapes = [];
-  const annotations = [];
   let rowCursor = 0;
   const rowGap = 0.9;
   const rowStep = 1.08;
@@ -428,18 +492,6 @@ function buildTracePlotData(sourceKey) {
     });
 
     const groupEnd = groupStart + (neuronIds.length - 1) * rowStep + 1;
-    const groupTop = -groupStart + 0.55;
-    const groupBottom = -(groupStart + (neuronIds.length - 1) * rowStep) - 0.15;
-    annotations.push({
-      xref: "paper",
-      x: 1.01,
-      yref: "y",
-      y: (groupTop + groupBottom) / 2,
-      text: `${roi.name} (${neuronIds.length})`,
-      showarrow: false,
-      font: { color: roi.color, size: 12 },
-      xanchor: "left",
-    });
     shapes.push({
       type: "line",
       xref: "paper",
@@ -454,20 +506,20 @@ function buildTracePlotData(sourceKey) {
   }
 
   const height = Math.max(320, Math.min(900, rowCursor * 15 + 80));
-  return { traces, shapes, annotations, height };
+  return { traces, shapes, height };
 }
 
 function renderTracePlot(plotId, sourceKey) {
   const plotDiv = document.getElementById(plotId);
-  const { traces, shapes, annotations, height } = buildTracePlotData(sourceKey);
+  const { traces, shapes, height } = buildTracePlotData(sourceKey);
   if (traces.length === 0) {
     Plotly.react(
       plotDiv,
       [],
       {
-        margin: { l: 40, r: 40, t: 20, b: 40 },
-        paper_bgcolor: "#fffdf8",
-        plot_bgcolor: "#fffdf8",
+        margin: { l: 18, r: 8, t: 12, b: 12 },
+        paper_bgcolor: "rgba(0,0,0,0)",
+        plot_bgcolor: "rgba(0,0,0,0)",
         annotations: [{
           x: 0.5,
           y: 0.5,
@@ -490,19 +542,16 @@ function renderTracePlot(plotId, sourceKey) {
     plotDiv,
     traces,
     {
-      margin: { l: 28, r: 90, t: 14, b: 42 },
-      paper_bgcolor: "#fffdf8",
-      plot_bgcolor: "#fffdf8",
+      margin: { l: 18, r: 8, t: 8, b: 8 },
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(0,0,0,0)",
       xaxis: {
-        title: "Time (s)",
-        showgrid: false,
-        zeroline: false,
+        visible: false,
       },
       yaxis: {
         visible: false,
       },
       shapes,
-      annotations,
       height,
       showlegend: false,
       hovermode: false,
@@ -522,7 +571,6 @@ function buildHeatmapData(sourceKey) {
   const x = Array.from({ length: nFrames }, (_, idx) => idx / frameRate);
   const z = [];
   const shapes = [];
-  const annotations = [];
   let rowCursor = 0;
 
   for (const roi of state.rois) {
@@ -561,33 +609,23 @@ function buildHeatmapData(sourceKey) {
       y1: endRow + 0.5,
       line: { color: "rgba(255,255,255,0.65)", width: 1.2 },
     });
-    annotations.push({
-      xref: "paper",
-      x: 1.01,
-      yref: "y",
-      y: (startRow + endRow) / 2,
-      text: `${roi.name} (${neuronIds.length})`,
-      showarrow: false,
-      font: { color: roi.color, size: 12 },
-      xanchor: "left",
-    });
   }
 
   const height = Math.max(320, Math.min(900, z.length * 10 + 80));
-  return { x, z, shapes, annotations, height };
+  return { x, z, shapes, height };
 }
 
 function renderHeatmapPlot(plotId, sourceKey) {
   const plotDiv = document.getElementById(plotId);
-  const { x, z, shapes, annotations, height } = buildHeatmapData(sourceKey);
+  const { x, z, shapes, height } = buildHeatmapData(sourceKey);
   if (z.length === 0) {
     Plotly.react(
       plotDiv,
       [],
       {
-        margin: { l: 40, r: 40, t: 20, b: 40 },
-        paper_bgcolor: "#fffdf8",
-        plot_bgcolor: "#fffdf8",
+        margin: { l: 18, r: 8, t: 12, b: 12 },
+        paper_bgcolor: "rgba(0,0,0,0)",
+        plot_bgcolor: "rgba(0,0,0,0)",
         annotations: [{
           x: 0.5,
           y: 0.5,
@@ -619,20 +657,17 @@ function renderHeatmapPlot(plotId, sourceKey) {
       hovertemplate: "Time %{x:.2f}s<br>z=%{z:.2f}<extra></extra>",
     }],
     {
-      margin: { l: 48, r: 90, t: 14, b: 42 },
-      paper_bgcolor: "#fffdf8",
-      plot_bgcolor: "#fffdf8",
+      margin: { l: 18, r: 8, t: 8, b: 8 },
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(0,0,0,0)",
       xaxis: {
-        title: "Time (s)",
-        showgrid: false,
-        zeroline: false,
+        visible: false,
       },
       yaxis: {
         visible: false,
         autorange: "reversed",
       },
       shapes,
-      annotations,
       height,
     },
     { responsive: true, displaylogo: false }
@@ -640,24 +675,27 @@ function renderHeatmapPlot(plotId, sourceKey) {
 }
 
 function updatePlots() {
-  for (const sourceKey of TRACE_SOURCE_ORDER) {
-    const viewSpec = TRACE_SOURCE_VIEW_SPECS[sourceKey];
-    if (!state.meta.trace_sources[sourceKey] || !viewSpec) {
-      continue;
-    }
-    renderTracePlot(viewSpec.tracePlotId, sourceKey);
-    renderHeatmapPlot(viewSpec.heatmapPlotId, sourceKey);
+  ensureValidActiveTraceSource();
+  renderSourceToggle("shared-source-toggle", state.activeSignalSource, (sourceKey) => {
+    state.activeSignalSource = sourceKey;
+    saveUiState();
+    updatePlots();
+  });
+
+  if (state.meta.trace_sources[state.activeSignalSource]) {
+    renderTracePlot("c-trace-plot", state.activeSignalSource);
+    renderHeatmapPlot("c-heatmap-plot", state.activeSignalSource);
   }
 }
 
 function exportPlot(plotId, filename) {
   const node = document.getElementById(plotId);
   Plotly.downloadImage(node, {
-    format: "png",
+    format: "svg",
     filename,
     width: Math.max(node.clientWidth, 1200),
     height: Math.max(node.clientHeight, 600),
-    scale: 2,
+    scale: 1,
   });
 }
 
@@ -671,26 +709,19 @@ function wireButtons() {
     updatePlots();
   });
 
-  for (const sourceKey of TRACE_SOURCE_ORDER) {
-    const viewSpec = TRACE_SOURCE_VIEW_SPECS[sourceKey];
-    if (!viewSpec) {
-      continue;
-    }
-    document.getElementById(viewSpec.traceDownloadButtonId).addEventListener("click", () => {
-      exportPlot(viewSpec.tracePlotId, viewSpec.traceDownloadName);
-    });
-    document.getElementById(viewSpec.heatmapDownloadButtonId).addEventListener("click", () => {
-      exportPlot(viewSpec.heatmapPlotId, viewSpec.heatmapDownloadName);
-    });
-  }
+  document.getElementById("download-c-traces-btn").addEventListener("click", () => {
+    exportPlot("c-trace-plot", `roi_traces_${state.activeSignalSource}`);
+  });
+  document.getElementById("download-c-heatmap-btn").addEventListener("click", () => {
+    exportPlot("c-heatmap-plot", `roi_heatmap_${state.activeSignalSource}`);
+  });
 
   window.addEventListener("resize", () => {
-    const plotDiv = document.getElementById("map-plot");
-    if (!plotDiv || !state.meta) {
+    if (!state.meta) {
       return;
     }
-    const width = plotDiv.clientWidth;
-    if (state.mapLastWidth === null || Math.abs(width - state.mapLastWidth) > 4) {
+    const nextKey = `${window.innerWidth}x${window.innerHeight}`;
+    if (state.mapViewportKey !== nextKey) {
       renderMap();
     }
   });
@@ -742,6 +773,7 @@ async function init() {
       state.rois = [roi];
       state.activeRoiId = roi.id;
     }
+    ensureValidActiveTraceSource();
     ensureAtLeastOneRoi();
     wireButtons();
     renderRoiList();

@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 import yaml
-import zarr
+import h5py
 from PIL import Image
 from caiman.source_extraction.cnmf.cnmf import load_CNMF
 from scipy import ndimage as ndi
@@ -24,8 +24,10 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAVE_SCHEMA_PATH = REPO_ROOT / "config" / "schema" / "save.yaml"
 
-TRACE_SOURCE_KEY = "c"
-TRACE_FILE_NAME = "traces_c.float32.bin"
+TRACE_SOURCE_FILES = {
+    "c": "traces_c.float32.bin",
+    "c_plus_yra": "traces_c_plus_yra.float32.bin",
+}
 POINTS_FILE_NAME = "points.json"
 METADATA_FILE_NAME = "metadata.json"
 BACKGROUND_DIRNAME = "backgrounds"
@@ -55,8 +57,6 @@ class PatchMeta:
     pcol: int
     h: int
     w: int
-    t: int
-    movie_path: Path
     model_path: Path
     y0: int = 0
     y1: int = 0
@@ -157,10 +157,22 @@ def get_profile_dir(extract_load_fold: Path) -> Path:
     return extract_load_fold / "patch-profile"
 
 
-def _collect_patch_meta(
-    y_load_fold: Path,
-    model_dir: Path,
-) -> list[PatchMeta]:
+def _read_model_patch_dims(model_path: Path) -> tuple[int, int]:
+    with h5py.File(model_path, "r") as handle:
+        dims_value = None
+        if "dims" in handle:
+            dims_value = handle["dims"][()]
+        elif "params" in handle and "data" in handle["params"] and "dims" in handle["params"]["data"]:
+            dims_value = handle["params"]["data"]["dims"][()]
+        if dims_value is None:
+            raise KeyError(f"Missing dims in model file: {model_path}")
+        dims = tuple(int(x) for x in np.asarray(dims_value).reshape(-1).tolist())
+        if len(dims) != 2:
+            raise ValueError(f"Model dims must have length 2, got {dims}: {model_path}")
+        return dims
+
+
+def _collect_patch_meta(model_dir: Path) -> list[PatchMeta]:
     patches: list[PatchMeta] = []
     model_files = sorted(model_dir.glob("*.hdf5"), key=lambda p: p.name)
     if not model_files:
@@ -169,20 +181,7 @@ def _collect_patch_meta(
     for model_path in model_files:
         patch_name = _model_file_to_patch_name(model_path)
         qrow, qcol, prow, pcol = _parse_patch_name(patch_name)
-        movie_path = y_load_fold / f"{patch_name}.tif"
-        if not movie_path.is_file():
-            raise FileNotFoundError(
-                f"Missing patch movie for model {model_path.name}: {movie_path}"
-            )
-        with tifffile.TiffFile(movie_path) as tif:
-            video = zarr.open(tif.aszarr(), mode="r")
-            if video.ndim != 3:
-                raise ValueError(
-                    f"Patch movie must be TYX, got ndim={video.ndim}: {movie_path}"
-                )
-            t = int(video.shape[0])
-            h = int(video.shape[1])
-            w = int(video.shape[2])
+        h, w = _read_model_patch_dims(model_path)
         patches.append(
             PatchMeta(
                 patch_name=patch_name,
@@ -192,8 +191,6 @@ def _collect_patch_meta(
                 pcol=pcol,
                 h=h,
                 w=w,
-                t=t,
-                movie_path=movie_path,
                 model_path=model_path,
             )
         )
@@ -466,31 +463,26 @@ def _write_background_png(bg_load_path: Path, output_path: Path) -> dict[str, ob
     }
 
 
-def _infer_dataset_root(extract_load_fold: Path) -> Path:
+def _infer_dataset_root(extract_load_fold: Path, crop_load_fold: Path) -> Path:
     dataset_root = extract_load_fold.parent
     if not extract_load_fold.is_dir():
         raise NotADirectoryError(f"Missing extract folder: {extract_load_fold}")
-    if not (dataset_root / "Y").is_dir():
-        raise NotADirectoryError(
-            f"Missing patch movie folder inferred from extract folder: {dataset_root / 'Y'}"
-        )
-    if not (dataset_root / "crop").is_dir():
-        raise NotADirectoryError(
-            f"Missing crop folder inferred from extract folder: {dataset_root / 'crop'}"
-        )
+    if not crop_load_fold.is_dir():
+        raise NotADirectoryError(f"Missing crop folder: {crop_load_fold}")
     return dataset_root
 
 
-def _prepare_patches(extract_load_fold: Path) -> tuple[Path, list[PatchMeta], int, int]:
-    dataset_root = _infer_dataset_root(extract_load_fold)
-    y_load_fold = dataset_root / "Y"
+def _prepare_patches(
+    extract_load_fold: Path,
+    crop_load_fold: Path,
+) -> tuple[Path, list[PatchMeta], int, int]:
+    dataset_root = _infer_dataset_root(extract_load_fold, crop_load_fold)
     model_dir = get_model_dir(extract_load_fold)
-    crop_dir = dataset_root / "crop"
     if not model_dir.is_dir():
         raise NotADirectoryError(f"Missing model folder: {model_dir}")
 
-    patches = _collect_patch_meta(y_load_fold, model_dir)
-    crop_params = _load_crop_params(crop_dir)
+    patches = _collect_patch_meta(model_dir)
+    crop_params = _load_crop_params(crop_load_fold)
     core_specs = {
         spec.name: (int(spec.y0), int(spec.y1), int(spec.x0), int(spec.x1))
         for spec in crop_params["patch_specs"]
@@ -569,16 +561,21 @@ def build_cache(
     *,
     bg_load_path: Path,
     extract_load_fold: Path,
+    crop_load_fold: Path,
     app_fold: Path,
 ) -> None:
     _suppress_noisy_loggers()
     extract_load_fold = extract_load_fold.resolve()
     bg_load_path = bg_load_path.resolve()
+    crop_load_fold = crop_load_fold.resolve()
     app_fold = app_fold.resolve()
     app_fold.mkdir(parents=True, exist_ok=True)
     (app_fold / BACKGROUND_DIRNAME).mkdir(parents=True, exist_ok=True)
 
-    dataset_root, patches, full_h, full_w = _prepare_patches(extract_load_fold)
+    dataset_root, patches, full_h, full_w = _prepare_patches(
+        extract_load_fold,
+        crop_load_fold,
+    )
     if not bg_load_path.is_file():
         raise FileNotFoundError(f"Missing background image: {bg_load_path}")
 
@@ -594,7 +591,9 @@ def build_cache(
     background_output = app_fold / BACKGROUND_DIRNAME / "background.png"
     background_specs = [_write_background_png(bg_load_path, background_output)]
 
-    all_trace_rows: list[np.ndarray] = []
+    all_trace_rows_by_source: dict[str, list[np.ndarray]] = {
+        source_key: [] for source_key in TRACE_SOURCE_FILES
+    }
     xs: list[int] = []
     ys: list[int] = []
     ids: list[int] = []
@@ -622,6 +621,17 @@ def build_cache(
 
         A = cnm_model.estimates.A.tocsc()
         C = np.asarray(cnm_model.estimates.C, dtype=np.float32)
+        YrA = cnm_model.estimates.YrA
+        if YrA is None:
+            YrA = np.zeros_like(C, dtype=np.float32)
+        else:
+            YrA = np.asarray(YrA, dtype=np.float32)
+            if YrA.shape != C.shape:
+                raise ValueError(
+                    f"Unexpected YrA shape mismatch at {patch.patch_name}: "
+                    f"C={C.shape}, YrA={YrA.shape}"
+                )
+        C_PLUS_YRA = C + YrA
         if trace_length is None:
             trace_length = int(C.shape[1])
         elif trace_length != int(C.shape[1]):
@@ -663,18 +673,23 @@ def build_cache(
             component_indices.append(int(component_index))
             for key in QUALITY_PROFILE_KEYS:
                 metric_columns[key].append(metrics[key])
-            all_trace_rows.append(np.asarray(C[component_index], dtype=np.float32))
+            all_trace_rows_by_source["c"].append(np.asarray(C[component_index], dtype=np.float32))
+            all_trace_rows_by_source["c_plus_yra"].append(
+                np.asarray(C_PLUS_YRA[component_index], dtype=np.float32)
+            )
             neuron_id += 1
 
-    if not all_trace_rows:
+    if not all_trace_rows_by_source["c"]:
         raise RuntimeError("No renderable neurons found for web cache.")
     if trace_length is None or frame_rate_hz is None:
         raise RuntimeError("Failed to infer trace metadata.")
 
-    traces = np.stack(all_trace_rows, axis=0).astype(np.float32, copy=False)
-    trace_stats = _compute_trace_stats(traces)
-    trace_file = app_fold / TRACE_FILE_NAME
-    traces.tofile(trace_file)
+    trace_stats_by_source: dict[str, dict[str, np.ndarray]] = {}
+    for source_key, rows in all_trace_rows_by_source.items():
+        traces = np.stack(rows, axis=0).astype(np.float32, copy=False)
+        trace_stats_by_source[source_key] = _compute_trace_stats(traces)
+        trace_file = app_fold / TRACE_SOURCE_FILES[source_key]
+        traces.tofile(trace_file)
 
     points_payload = {
         "id": ids,
@@ -687,10 +702,11 @@ def build_cache(
             for key, values in metric_columns.items()
         },
         "trace_stats": {
-            TRACE_SOURCE_KEY: {
+            source_key: {
                 stat_key: [_json_float_or_none(v) for v in values.astype(np.float32)]
                 for stat_key, values in trace_stats.items()
             }
+            for source_key, trace_stats in trace_stats_by_source.items()
         },
     }
     points_file = app_fold / POINTS_FILE_NAME
@@ -699,6 +715,7 @@ def build_cache(
     metadata = {
         "dataset_root": str(dataset_root),
         "extract_load_fold": str(extract_load_fold),
+        "crop_load_fold": str(crop_load_fold),
         "bg_load_path": str(bg_load_path),
         "app_fold": str(app_fold),
         "full_height": int(full_h),
@@ -707,10 +724,16 @@ def build_cache(
         "frame_rate_hz": float(frame_rate_hz),
         "neuron_count": int(len(ids)),
         "trace_sources": {
-            TRACE_SOURCE_KEY: {
-                "file": TRACE_FILE_NAME,
+            "c": {
+                "file": TRACE_SOURCE_FILES["c"],
                 "label": "C",
                 "description": "CNMF fitted temporal trace",
+                "dtype": "float32",
+            },
+            "c_plus_yra": {
+                "file": TRACE_SOURCE_FILES["c_plus_yra"],
+                "label": "C + YrA",
+                "description": "CNMF fitted temporal trace plus YrA residual",
                 "dtype": "float32",
             }
         },
@@ -732,6 +755,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build cache files for the standalone neuron ROI web app.")
     parser.add_argument("--bg_load_path", type=Path, required=True, help="Path to the background TIFF.")
     parser.add_argument("--extract_load_fold", type=Path, required=True, help="Path to the extract folder.")
+    parser.add_argument("--crop_load_fold", type=Path, required=True, help="Path to the crop folder.")
     parser.add_argument("--app_fold", type=Path, required=True, help="Path to the app cache folder.")
     args = parser.parse_args()
 
@@ -739,6 +763,7 @@ def main() -> None:
     build_cache(
         bg_load_path=args.bg_load_path,
         extract_load_fold=args.extract_load_fold,
+        crop_load_fold=args.crop_load_fold,
         app_fold=args.app_fold,
     )
 

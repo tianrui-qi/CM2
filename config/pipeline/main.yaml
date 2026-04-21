@@ -44,6 +44,6 @@ save:
   enable: ${enable}
   x_load_path: ${x_path}
   y_load_path: ${y_path}
-  crop_load_path: ${crop.crop_save_fold}
+  crop_load_fold: ${crop.crop_save_fold}
   extract_fold: ${extract.extract_save_fold}
   save_fold: null         # default: dirname(y_load_fold)/save/
